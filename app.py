@@ -3,12 +3,325 @@ import os
 import sys
 import time
 import threading
+import webbrowser
+import signal
+from AppKit import NSApplication
 from keychain_manager import KeychainManager
 from mail_checker import MailChecker
 from vpn_connector import VPNConnector
 
 # rumps 디버깅 무시 (릴리즈용)
 rumps.debug_mode(False)
+
+class SettingsHTTPServer:
+    def __init__(self, port, service_name, on_save_callback):
+        self.port = port
+        self.service_name = service_name
+        self.on_save_callback = on_save_callback
+        self.server = None
+
+    def start(self):
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        import urllib.parse
+
+        # HTTPServer가 로컬 호스트에 바인딩되어 외부 접근을 원천 차단하고 보안을 강화합니다.
+        class SettingsHandler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                # 불필요한 HTTP 로그로 터미널이 어지러워지는 것을 방지
+                pass
+
+            def do_GET(self):
+                if self.path == "/":
+                    self.send_response(200)
+                    self.send_header("Content-type", "text/html; charset=utf-8")
+                    self.end_headers()
+                    
+                    # 키체인에서 암호화 저장된 최신 값 로드 (보안 강화)
+                    vpn_host = KeychainManager.get_password(FortiAutoConnApp.SERVICE_NAME, "vpn_host") or ""
+                    vpn_port = KeychainManager.get_password(FortiAutoConnApp.SERVICE_NAME, "vpn_port") or "443"
+                    vpn_user = KeychainManager.get_password(FortiAutoConnApp.SERVICE_NAME, "vpn_user") or ""
+                    mail_host = KeychainManager.get_password(FortiAutoConnApp.SERVICE_NAME, "mail_host") or "imap.daum.net"
+                    mail_port = KeychainManager.get_password(FortiAutoConnApp.SERVICE_NAME, "mail_port") or "993"
+                    mail_user = KeychainManager.get_password(FortiAutoConnApp.SERVICE_NAME, "mail_user") or ""
+
+                    # 프리미엄 다크 글래스모피즘 테마의 반응형 HTML/CSS UI
+                    html = f"""<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FortiAutoConn 환경 설정</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&family=Noto+Sans+KR:wght@300;400;700&display=swap" rel="stylesheet">
+    <style>
+        :root {{
+            --bg-color: #0f0f1a;
+            --panel-bg: rgba(30, 30, 46, 0.65);
+            --border-color: rgba(255, 255, 255, 0.08);
+            --accent-color: #89b4fa;
+            --accent-glow: rgba(137, 180, 250, 0.35);
+            --text-color: #cdd6f4;
+            --text-muted: #a6adc8;
+            --success-color: #a6e3a1;
+        }}
+        * {{
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: 'Outfit', 'Noto Sans KR', sans-serif;
+        }}
+        body {{
+            background: radial-gradient(circle at 50% 50%, #1e1e2f 0%, var(--bg-color) 100%);
+            color: var(--text-color);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            overflow-x: hidden;
+        }}
+        .container {{
+            background: var(--panel-bg);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            border: 1px solid var(--border-color);
+            border-radius: 24px;
+            width: 100%;
+            max-width: 520px;
+            padding: 40px;
+            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
+            animation: fadeIn 0.8s cubic-bezier(0.16, 1, 0.3, 1);
+        }}
+        @keyframes fadeIn {{
+            from {{ opacity: 0; transform: translateY(20px); }}
+            to {{ opacity: 1; transform: translateY(0); }}
+        }}
+        .header {{
+            text-align: center;
+            margin-bottom: 35px;
+        }}
+        .logo {{
+            font-size: 2.2rem;
+            font-weight: 800;
+            background: linear-gradient(135deg, #89b4fa 0%, #b4befe 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 8px;
+            letter-spacing: -0.5px;
+        }}
+        .subtitle {{
+            font-size: 0.95rem;
+            color: var(--text-muted);
+            font-weight: 300;
+        }}
+        .section-title {{
+            font-size: 1.05rem;
+            font-weight: 600;
+            color: var(--accent-color);
+            margin: 25px 0 15px 0;
+            display: flex;
+            align-items: center;
+            letter-spacing: 0.5px;
+        }}
+        .section-title::after {{
+            content: '';
+            flex: 1;
+            height: 1px;
+            background: linear-gradient(to right, rgba(137, 180, 250, 0.4), transparent);
+            margin-left: 15px;
+        }}
+        .form-group {{
+            margin-bottom: 18px;
+        }}
+        .form-row {{
+            display: flex;
+            gap: 15px;
+        }}
+        .form-row .form-group {{
+            flex: 1;
+        }}
+        label {{
+            display: block;
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            margin-bottom: 6px;
+            font-weight: 600;
+        }}
+        input {{
+            width: 100%;
+            background: rgba(17, 17, 27, 0.5);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 12px 16px;
+            color: var(--text-color);
+            font-size: 0.95rem;
+            outline: none;
+            transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+        }}
+        input:focus {{
+            border-color: var(--accent-color);
+            box-shadow: 0 0 15px var(--accent-glow);
+            background: rgba(17, 17, 27, 0.8);
+        }}
+        .btn-submit {{
+            width: 100%;
+            background: linear-gradient(135deg, #89b4fa 0%, #74c7ec 100%);
+            border: none;
+            border-radius: 14px;
+            padding: 16px;
+            color: #11111b;
+            font-size: 1.05rem;
+            font-weight: 700;
+            cursor: pointer;
+            margin-top: 30px;
+            box-shadow: 0 8px 24px rgba(116, 199, 236, 0.25);
+            transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+        }}
+        .btn-submit:hover {{
+            transform: translateY(-2px);
+            box-shadow: 0 12px 30px rgba(116, 199, 236, 0.4);
+            filter: brightness(1.1);
+        }}
+        .btn-submit:active {{
+            transform: translateY(1px);
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="logo">FortiAutoConn</div>
+            <div class="subtitle">보안 게이트웨이 및 인증 메일 계정 설정</div>
+        </div>
+        <form action="/save" method="POST">
+            <div class="section-title">🔒 VPN Gateway 설정</div>
+            <div class="form-row">
+                <div class="form-group" style="flex: 2;">
+                    <label for="vpn_host">VPN Host</label>
+                    <input type="text" id="vpn_host" name="vpn_host" placeholder="vpn.company.com" value="{vpn_host}" required autofocus>
+                </div>
+                <div class="form-group" style="flex: 1;">
+                    <label for="vpn_port">VPN Port</label>
+                    <input type="text" id="vpn_port" name="vpn_port" placeholder="443" value="{vpn_port}" required>
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="vpn_user">VPN Username</label>
+                    <input type="text" id="vpn_user" name="vpn_user" placeholder="사번 또는 계정 ID" value="{vpn_user}" required>
+                </div>
+                <div class="form-group">
+                    <label for="vpn_pass">VPN Password</label>
+                    <input type="password" id="vpn_pass" name="vpn_pass" placeholder="••••••••" required>
+                </div>
+            </div>
+
+            <div class="section-title">✉️ 인증 메일 IMAP 설정</div>
+            <div class="form-row">
+                <div class="form-group" style="flex: 2;">
+                    <label for="mail_host">IMAP Host</label>
+                    <input type="text" id="mail_host" name="mail_host" placeholder="imap.daum.net" value="{mail_host}" required>
+                </div>
+                <div class="form-group" style="flex: 1;">
+                    <label for="mail_port">IMAP Port</label>
+                    <input type="text" id="mail_port" name="mail_port" placeholder="993" value="{mail_port}" required>
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="mail_user">Mail Address / ID</label>
+                    <input type="text" id="mail_user" name="mail_user" placeholder="이메일 주소 또는 ID" value="{mail_user}" required>
+                </div>
+                <div class="form-group">
+                    <label for="mail_pass">Mail Password</label>
+                    <input type="password" id="mail_pass" name="mail_pass" placeholder="••••••••" required>
+                </div>
+            </div>
+
+            <button type="submit" class="btn-submit">설정 정보 저장 및 등록</button>
+        </form>
+    </div>
+</body>
+</html>
+"""
+                    self.wfile.write(html.encode("utf-8"))
+
+            def do_POST(self):
+                if self.path == "/save":
+                    content_length = int(self.headers['Content-Length'])
+                    post_data = self.rfile.read(content_length).decode('utf-8')
+                    params = urllib.parse.parse_qs(post_data)
+
+                    # 파라미터 값 추출
+                    data = {k: v[0].strip() for k, v in params.items()}
+
+                    # 안전하게 키체인에 대칭 암호화 저장
+                    KeychainManager.save_password(FortiAutoConnApp.SERVICE_NAME, "vpn_host", data.get("vpn_host", ""))
+                    KeychainManager.save_password(FortiAutoConnApp.SERVICE_NAME, "vpn_port", data.get("vpn_port", ""))
+                    KeychainManager.save_password(FortiAutoConnApp.SERVICE_NAME, "vpn_user", data.get("vpn_user", ""))
+                    KeychainManager.save_password(FortiAutoConnApp.SERVICE_NAME, "vpn_pass", data.get("vpn_pass", ""))
+                    KeychainManager.save_password(FortiAutoConnApp.SERVICE_NAME, "mail_host", data.get("mail_host", ""))
+                    KeychainManager.save_password(FortiAutoConnApp.SERVICE_NAME, "mail_port", data.get("mail_port", ""))
+                    KeychainManager.save_password(FortiAutoConnApp.SERVICE_NAME, "mail_user", data.get("mail_user", ""))
+                    KeychainManager.save_password(FortiAutoConnApp.SERVICE_NAME, "mail_pass", data.get("mail_pass", ""))
+
+                    # 성공 안내 페이지 송출
+                    self.send_response(200)
+                    self.send_header("Content-type", "text/html; charset=utf-8")
+                    self.end_headers()
+
+                    success_html = """<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>설정 완료</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;700&family=Noto+Sans+KR:wght@400;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            background: #0f0f1a;
+            color: #cdd6f4;
+            font-family: 'Outfit', 'Noto Sans KR', sans-serif;
+            height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .card {
+            background: rgba(30, 30, 46, 0.8);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 20px;
+            padding: 40px;
+            text-align: center;
+            max-width: 400px;
+            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
+        }
+        h1 { color: #a6e3a1; margin-bottom: 15px; }
+        p { color: #a6adc8; font-size: 0.95rem; line-height: 1.6; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>✓ 설정 등록 완료</h1>
+        <p>모든 자격 증명이 macOS Keychain에 안전하게 대칭 암호화 저장되었습니다.<br><br>이제 이 브라우저 창을 닫으셔도 좋습니다.</p>
+    </div>
+</body>
+</html>
+"""
+                    self.wfile.write(success_html.encode("utf-8"))
+
+                    # 서버 종료 및 후속 조치를 위해 콜백 실행
+                    if self.server.on_save_callback:
+                        threading.Thread(target=self.server.on_save_callback).start()
+
+        # 대기 시간 없는 바인딩
+        self.server = HTTPServer(('127.0.0.1', self.port), SettingsHandler)
+        self.server.on_save_callback = self.on_save_callback
+        self.server.serve_forever()
+
+    def stop(self):
+        if self.server:
+            # shutdown()은 serve_forever() 루프를 안전하게 종료시킵니다.
+            self.server.shutdown()
+            self.server.server_close()
 
 class FortiAutoConnApp(rumps.App):
     SERVICE_NAME = "FortiAutoConn"
@@ -36,6 +349,7 @@ class FortiAutoConnApp(rumps.App):
         self.cached_creds = None      # 백그라운드 자동 재연결을 위해 메모리에만 세션 안전하게 유지
         self.auto_reconnect_enabled = False
         self.reconnect_timer = None
+        self.settings_server = None
 
     def update_ui(self, status):
         """VPNConnector의 상태 코드에 맞춰 메뉴바 UI 및 OS 알림을 송출합니다."""
@@ -90,7 +404,6 @@ class FortiAutoConnApp(rumps.App):
             
         print("[App] 8시간 세션 만료 등에 대응하는 자동 백그라운드 재접속 구동...")
         
-        # 캐싱된 접속정보를 사용하여 터치 ID 창을 추가로 띄우지 않고 자연스럽게 복구
         c = self.cached_creds
         mail_checker = MailChecker(
             host=c["mail_host"],
@@ -110,16 +423,22 @@ class FortiAutoConnApp(rumps.App):
         self.connector.start()
 
     def on_connect(self, sender):
-        """Connect VPN 메뉴 버튼 클릭 이벤트 처리"""
+        """Connect VPN 메뉴 버튼 클릭 이벤트 처리 (메인 스레드 대기 방지를 위해 백그라운드 스레드에서 비동기 처리)"""
+        threading.Thread(target=self._bg_connect, daemon=True).start()
+
+    def _bg_connect(self):
+        # Touch ID 시스템 프롬프트가 포커스를 받을 수 있도록 앱 강제 활성화
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        
         # 1. 지문인식(Touch ID) 또는 로컬 로그인 암호 확인 팝업 호출
         if not KeychainManager.authenticate_touch_id("FortiVPN 보안 터널 형성을 위해 본인 생체정보를 인증해 주세요."):
-            rumps.alert("보안 인증 오류", "맥북 본인인증(Touch ID)이 차단되거나 취소되어 저장된 키체인 자격증명을 불러올 수 없습니다.")
+            self._safe_alert("보안 인증 오류", "맥북 본인인증(Touch ID)이 차단되거나 취소되어 저장된 키체인 자격증명을 불러올 수 없습니다.")
             return
 
         # 2. 키체인 저장 정보 로드
         creds = self._load_credentials_from_keychain()
         if not creds:
-            rumps.alert("자격 증명 미설정", "설정된 VPN 혹은 메일 계정 정보가 없습니다. 메뉴에서 'Settings'를 선택하여 최초 1회 등록해 주세요.")
+            self._safe_alert("자격 증명 미설정", "설정된 VPN 혹은 메일 계정 정보가 없습니다. 메뉴에서 'Settings'를 선택하여 최초 1회 등록해 주세요.")
             self.on_settings(None)
             return
 
@@ -145,9 +464,12 @@ class FortiAutoConnApp(rumps.App):
         )
         self.connector.start()
 
+    def _safe_alert(self, title, message):
+        """서브 스레드에서 호출 시 메인 UI를 블로킹하지 않도록 안전하게 대화상자 호출"""
+        threading.Thread(target=lambda: rumps.alert(title, message), daemon=True).start()
+
     def on_disconnect(self, sender):
         """Disconnect VPN 메뉴 버튼 클릭 이벤트 처리 (수동 해제)"""
-        # 명시적인 수동 해제이므로 자동 재연결 시스템을 비활성화 처리함
         self.auto_reconnect_enabled = False
         if self.reconnect_timer:
             self.reconnect_timer.cancel()
@@ -160,100 +482,31 @@ class FortiAutoConnApp(rumps.App):
         rumps.notification("FortiAutoConn", "VPN 접속 종료 완료", "자동화 VPN 터널 연결이 정상 해제되었습니다.")
 
     def on_settings(self, sender):
-        """rumps standard prompt를 사용한 자격증명 정보 기입 및 키체인 등록"""
-        # 1. VPN 게이트웨이 주소
-        vpn_host_win = rumps.Window(
-            message="접속할 VPN 서버 주소를 입력해 주세요.\n(예: vpn.company.com)",
-            title="VPN Host",
-            default_text=KeychainManager.get_password(self.SERVICE_NAME, "vpn_host") or ""
-        )
-        vpn_host_res = vpn_host_win.run()
-        if not vpn_host_res.clicked: return
-        vpn_host = vpn_host_res.text.strip()
+        """로컬 웹 서버를 스레드로 가동하고 브라우저를 띄워 설정을 안전하게 입력받습니다."""
+        if self.settings_server:
+            # 이미 서버가 돌고 있으면 브라우저 창만 한 번 더 띄워줍니다.
+            webbrowser.open("http://127.0.0.1:18372/")
+            return
+
+        def on_save_success():
+            # 저장 성공 시 알림 후 서버 해제
+            NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+            rumps.notification("FortiAutoConn", "설정 갱신 완료", "새로운 설정이 시스템 Keychain에 성공적으로 업데이트되었습니다.")
+            
+            # 약간의 딜레이를 주어 브라우저가 완료 응답 HTML을 모두 송출한 후 웹 서버를 소멸시킵니다.
+            time.sleep(1.0)
+            if self.settings_server:
+                self.settings_server.stop()
+                self.settings_server = None
+
+        # 로컬 루프백 전용 웹 서버 구동
+        self.settings_server = SettingsHTTPServer(18372, self.SERVICE_NAME, on_save_success)
         
-        # 2. VPN 포트번호 (보통 SSL VPN은 443 사용)
-        vpn_port_win = rumps.Window(
-            message="VPN 포트 번호를 지정해 주세요.",
-            title="VPN Port",
-            default_text=KeychainManager.get_password(self.SERVICE_NAME, "vpn_port") or "443"
-        )
-        vpn_port_res = vpn_port_win.run()
-        if not vpn_port_res.clicked: return
-        vpn_port = vpn_port_res.text.strip()
-
-        # 3. VPN ID
-        vpn_user_win = rumps.Window(
-            message="VPN 접속 로그인 계정(ID)을 입력해 주세요.",
-            title="VPN Username",
-            default_text=KeychainManager.get_password(self.SERVICE_NAME, "vpn_user") or ""
-        )
-        vpn_user_res = vpn_user_win.run()
-        if not vpn_user_res.clicked: return
-        vpn_user = vpn_user_res.text.strip()
-
-        # 4. VPN 패스워드 (secure 모드로 암호 노출 숨김 처리)
-        vpn_pass_win = rumps.Window(
-            message="VPN 로그인 패스워드를 입력해 주세요.",
-            title="VPN Password",
-            default_text="",
-            secure=True
-        )
-        vpn_pass_res = vpn_pass_win.run()
-        if not vpn_pass_res.clicked: return
-        vpn_pass = vpn_pass_res.text.strip()
-
-        # 5. IMAP Host (Daum / Kakao 주소 예시 추천 안내)
-        mail_host_win = rumps.Window(
-            message="인증 메일이 수신되는 메일의 IMAP 서버 호스트명을 기입해 주세요.\n(다음메일: imap.daum.net / 카카오메일: imap.kakao.com)",
-            title="IMAP Host",
-            default_text=KeychainManager.get_password(self.SERVICE_NAME, "mail_host") or "imap.daum.net"
-        )
-        mail_host_res = mail_host_win.run()
-        if not mail_host_res.clicked: return
-        mail_host = mail_host_res.text.strip()
-
-        # 6. IMAP SSL Port (기본 993)
-        mail_port_win = rumps.Window(
-            message="IMAP 포트 번호를 입력해 주세요.",
-            title="IMAP Port",
-            default_text=KeychainManager.get_password(self.SERVICE_NAME, "mail_port") or "993"
-        )
-        mail_port_res = mail_port_win.run()
-        if not mail_port_res.clicked: return
-        mail_port = mail_port_res.text.strip()
-
-        # 7. 이메일 아이디(주소 전체)
-        mail_user_win = rumps.Window(
-            message="인증 메일을 받는 본인의 이메일 주소 전체를 기입해 주세요.\n(예: user@daum.net)",
-            title="Mail ID",
-            default_text=KeychainManager.get_password(self.SERVICE_NAME, "mail_user") or ""
-        )
-        mail_user_res = mail_user_win.run()
-        if not mail_user_res.clicked: return
-        mail_user = mail_user_res.text.strip()
-
-        # 8. 이메일 비밀번호 (secure 모드)
-        mail_pass_win = rumps.Window(
-            message="해당 이메일의 로그인 패스워드(또는 전용 앱 2차 패스워드)를 입력해 주세요.",
-            title="Mail Password",
-            default_text="",
-            secure=True
-        )
-        mail_pass_res = mail_pass_win.run()
-        if not mail_pass_res.clicked: return
-        mail_pass = mail_pass_res.text.strip()
-
-        # 키체인에 일괄 기입 처리
-        KeychainManager.save_password(self.SERVICE_NAME, "vpn_host", vpn_host)
-        KeychainManager.save_password(self.SERVICE_NAME, "vpn_port", vpn_port)
-        KeychainManager.save_password(self.SERVICE_NAME, "vpn_user", vpn_user)
-        KeychainManager.save_password(self.SERVICE_NAME, "vpn_pass", vpn_pass)
-        KeychainManager.save_password(self.SERVICE_NAME, "mail_host", mail_host)
-        KeychainManager.save_password(self.SERVICE_NAME, "mail_port", mail_port)
-        KeychainManager.save_password(self.SERVICE_NAME, "mail_user", mail_user)
-        KeychainManager.save_password(self.SERVICE_NAME, "mail_pass", mail_pass)
-
-        rumps.alert("설정 등록 완료", "입력하신 모든 정보가 macOS 시스템 Keychain에 안전하게 대칭 암호화 저장되었습니다.")
+        server_thread = threading.Thread(target=self.settings_server.start, daemon=True)
+        server_thread.start()
+        
+        # 기본 브라우저 자동 호출
+        webbrowser.open("http://127.0.0.1:18372/")
 
     def _load_credentials_from_keychain(self):
         """키체인 보안 풀에서 설정 정보 로드"""
@@ -266,7 +519,6 @@ class FortiAutoConnApp(rumps.App):
         mail_user = KeychainManager.get_password(self.SERVICE_NAME, "mail_user")
         mail_pass = KeychainManager.get_password(self.SERVICE_NAME, "mail_pass")
 
-        # 누락된 값이 하나라도 있으면 저장 정보 부재로 인식
         if not all([vpn_host, vpn_port, vpn_user, vpn_pass, mail_host, mail_port, mail_user, mail_pass]):
             return None
 
@@ -288,8 +540,18 @@ class FortiAutoConnApp(rumps.App):
             self.reconnect_timer.cancel()
         if self.connector:
             self.connector.stop()
+        if self.settings_server:
+            self.settings_server.stop()
         super(FortiAutoConnApp, self).terminate()
 
+def sigint_handler(sig, frame):
+    print("\n[FortiAutoConn] 사용자에 의해 강제 종료 시그널(SIGINT)이 감지되었습니다. 즉시 완전히 종료합니다.")
+    # 터미널에서 Ctrl+C를 눌렀을 때 루프 대기 없이 즉각적으로 완벽하게 사멸 처리
+    os._exit(0)
+
 if __name__ == "__main__":
+    # Ctrl+C 시그널 핸들러 연결
+    signal.signal(signal.SIGINT, sigint_handler)
+    
     app = FortiAutoConnApp()
     app.run()
