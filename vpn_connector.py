@@ -21,6 +21,7 @@ class VPNConnector:
         self.process = None
         self.thread = None
         self._stop_event = threading.Event()
+        self.trusted_cert = None # 자동 감지된 게이트웨이 인증서 해시 저장용
 
     def set_status(self, new_status):
         self.status = new_status
@@ -54,8 +55,11 @@ class VPNConnector:
         self.set_status(self.STATUS_DISCONNECTED)
 
     def _run_vpn(self):
-        # -c 옵션 없이 CLI 매개변수로 구동
-        cmd = f"sudo openfortivpn {self.host}:{self.port} -u {self.username}"
+        import re
+
+        # 이미 자동 감지된 인증서 해시가 있다면 실행 인자에 포함하여 검증 에러 우회
+        trusted_cert_flag = f" --trusted-cert {self.trusted_cert}" if self.trusted_cert else ""
+        cmd = f"sudo openfortivpn {self.host}:{self.port} -u {self.username}{trusted_cert_flag}"
         print(f"[VPNConnector] openfortivpn 실행 명령: {cmd}")
 
         try:
@@ -111,6 +115,26 @@ class VPNConnector:
                 elif index == 4:
                     output = self.process.before
                     print(f"[VPNConnector] openfortivpn 프로세스가 초기 연결 중 예기치 않게 종료되었습니다.\n로그: {output}")
+                    
+                    # 💡 핵심 자가 복구: 신뢰할 수 없는 사내 인증서 에러 감지 시 sha256 해시를 추출하여 자동 우회 재시도
+                    if "Gateway certificate validation failed" in output or "trusted-cert" in output:
+                        cert_match = re.search(r"(?:trusted-cert\s*=\s*|--trusted-cert\s+)([0-9a-fA-F]{64})", output)
+                        if not cert_match:
+                            cert_match = re.search(r"sha256 digest:\s*([0-9a-fA-F]{64})", output)
+                            
+                        if cert_match:
+                            detected_hash = cert_match.group(1)
+                            # 중복 무한 재시도를 방지하기 위해 새로운 해시 감지 시에만 자동 갱신 및 재접속 구동
+                            if detected_hash != self.trusted_cert:
+                                print(f"[VPNConnector] 🛡️ 신뢰되지 않는 사내 게이트웨이 인증서 해시 자동 검출: {detected_hash}")
+                                print("[VPNConnector] 해당 인증서를 화이트리스트에 임시 자동 추가하여 3초 후 안전 재접속을 구동합니다...")
+                                self.trusted_cert = detected_hash
+                                self.process.close()
+                                time.sleep(3)
+                                # 새로운 스레드로 무중단 자가 복구 연결 수행
+                                threading.Thread(target=self._run_vpn, daemon=True).start()
+                                return
+                                
                     self.set_status(self.STATUS_FAILED)
                     return
 

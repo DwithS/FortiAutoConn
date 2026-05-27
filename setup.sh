@@ -29,15 +29,28 @@ fi
 
 # 2. Python 라이브러리 의존성 설치
 echo -e "\n${YELLOW}[2/3] Python 환경에 필요한 필수 패키지 설치...${NC}"
-if ! command -v pip3 &> /dev/null; then
-    echo -e "${RED}Python3 또는 pip3 도구를 찾을 수 없습니다. 맥북의 Python 환경을 점검해 주세요.${NC}"
-    exit 1
+
+# 시스템 pip3를 직접 쓰지 않고 가상환경(.venv) 격리 방식을 유도하여 macOS 보안 차단(PEP 668) 원천 회피
+if command -v uv &> /dev/null; then
+    echo -e "${GREEN}시스템에서 'uv'를 감지했습니다. uv를 활용해 격리된 가상환경에 초고속 설치를 진행합니다...${NC}"
+    uv venv &> /dev/null
+    uv pip install -r requirements.txt
+    INSTALL_OK=$?
+else
+    echo -e "기본 python3 venv 가상환경 빌드를 통한 의존성 격리 설치를 시도합니다..."
+    if ! command -v python3 &> /dev/null; then
+        echo -e "${RED}Python3 도구를 찾을 수 없습니다. 맥북의 Python 환경을 점검해 주세요.${NC}"
+        exit 1
+    fi
+    python3 -m venv .venv
+    source .venv/bin/activate
+    pip install --upgrade pip
+    pip install -r requirements.txt
+    INSTALL_OK=$?
 fi
 
-echo -e "requirements.txt 파일을 기반으로 의존성 패키지를 갱신합니다..."
-pip3 install -r requirements.txt
-if [ $? -eq 0 ]; then
-    echo -e "${GREEN}Python 의존성 라이브러리가 성공적으로 전체 구축되었습니다.${NC}"
+if [ $INSTALL_OK -eq 0 ]; then
+    echo -e "${GREEN}Python 의존성 라이브러리가 가상환경(.venv) 내에 안전하고 투명하게 격리 구축되었습니다.${NC}"
 else
     echo -e "${RED}Python 의존성 패키지 설치 도중 문제가 발생했습니다. 에러 로그를 점검해 주세요.${NC}"
     exit 1

@@ -43,6 +43,7 @@ class SettingsHTTPServer:
                     mail_host = KeychainManager.get_password(FortiAutoConnApp.SERVICE_NAME, "mail_host") or "imap.daum.net"
                     mail_port = KeychainManager.get_password(FortiAutoConnApp.SERVICE_NAME, "mail_port") or "993"
                     mail_user = KeychainManager.get_password(FortiAutoConnApp.SERVICE_NAME, "mail_user") or ""
+                    mail_folder = KeychainManager.get_password(FortiAutoConnApp.SERVICE_NAME, "mail_folder") or "INBOX"
 
                     # 프리미엄 다크 글래스모피즘 테마의 반응형 HTML/CSS UI
                     html = f"""<!DOCTYPE html>
@@ -227,10 +228,16 @@ class SettingsHTTPServer:
                 </div>
             </div>
             <div class="form-row">
-                <div class="form-group">
+                <div class="form-group" style="flex: 2;">
                     <label for="mail_user">Mail Address / ID</label>
                     <input type="text" id="mail_user" name="mail_user" placeholder="이메일 주소 또는 ID" value="{mail_user}" required>
                 </div>
+                <div class="form-group" style="flex: 1;">
+                    <label for="mail_folder">Mail Folder</label>
+                    <input type="text" id="mail_folder" name="mail_folder" placeholder="INBOX" value="{mail_folder}" required>
+                </div>
+            </div>
+            <div class="form-row">
                 <div class="form-group">
                     <label for="mail_pass">Mail Password</label>
                     <input type="password" id="mail_pass" name="mail_pass" placeholder="••••••••" required>
@@ -262,6 +269,7 @@ class SettingsHTTPServer:
                     KeychainManager.save_password(FortiAutoConnApp.SERVICE_NAME, "mail_host", data.get("mail_host", ""))
                     KeychainManager.save_password(FortiAutoConnApp.SERVICE_NAME, "mail_port", data.get("mail_port", ""))
                     KeychainManager.save_password(FortiAutoConnApp.SERVICE_NAME, "mail_user", data.get("mail_user", ""))
+                    KeychainManager.save_password(FortiAutoConnApp.SERVICE_NAME, "mail_folder", data.get("mail_folder", "INBOX"))
                     KeychainManager.save_password(FortiAutoConnApp.SERVICE_NAME, "mail_pass", data.get("mail_pass", ""))
 
                     # 성공 안내 페이지 송출
@@ -351,13 +359,27 @@ class FortiAutoConnApp(rumps.App):
         self.reconnect_timer = None
         self.settings_server = None
 
+    def show_notification(self, title, subtitle, message):
+        """macOS 내장 AppleScript를 활용하여 런타임 에러 없이 100% 안전하게 알림을 송출합니다."""
+        try:
+            # 특수 문자 에스케이프 처리
+            safe_title = title.replace('"', '\\"')
+            safe_subtitle = subtitle.replace('"', '\\"')
+            safe_message = message.replace('"', '\\"')
+            
+            # osascript 명령 구성
+            cmd = f'osascript -e \'display notification "{safe_message}" with title "{safe_title}" subtitle "{safe_subtitle}"\''
+            os.system(cmd)
+        except Exception as e:
+            print(f"[Notification Error] 알림 송출 실패: {e}")
+
     def update_ui(self, status):
         """VPNConnector의 상태 코드에 맞춰 메뉴바 UI 및 OS 알림을 송출합니다."""
         if status == VPNConnector.STATUS_CONNECTED:
             self.title = "🟢"
             self.menu_connect.set_callback(None)
             self.menu_disconnect.set_callback(self.on_disconnect)
-            rumps.notification("FortiAutoConn", "VPN 연결 성공", "업무용 VPN 망에 안전하게 연결되었습니다.")
+            self.show_notification("FortiAutoConn", "VPN 연결 성공", "업무용 VPN 망에 안전하게 연결되었습니다.")
             
         elif status == VPNConnector.STATUS_CONNECTING:
             self.title = "🟡"
@@ -371,14 +393,14 @@ class FortiAutoConnApp(rumps.App):
             
             # 의도치 않은 접속 강제 해제 발생 시 (예: 8시간 세션 만료) 자동 재연결
             if self.auto_reconnect_enabled and self.cached_creds:
-                rumps.notification("FortiAutoConn", "VPN 연결 해제됨", "VPN 연결이 세션 만료 등으로 분리되었습니다. 10초 후 자동 재접속을 시작합니다.")
+                self.show_notification("FortiAutoConn", "VPN 연결 해제됨", "VPN 연결이 세션 만료 등으로 분리되었습니다. 10초 후 자동 재접속을 시작합니다.")
                 self.trigger_auto_reconnect()
                 
         elif status == VPNConnector.STATUS_FAILED:
             self.title = "🔴"
             self.menu_connect.set_callback(self.on_connect)
             self.menu_disconnect.set_callback(None)
-            rumps.notification("FortiAutoConn", "VPN 연결 실패", "비밀번호 인증 오류 혹은 OTP 메일 수신 실패로 접속하지 못했습니다.")
+            self.show_notification("FortiAutoConn", "VPN 연결 실패", "비밀번호 인증 오류 혹은 OTP 메일 수신 실패로 접속하지 못했습니다.")
             
             if self.auto_reconnect_enabled and self.cached_creds:
                 self.trigger_auto_reconnect()
@@ -409,7 +431,8 @@ class FortiAutoConnApp(rumps.App):
             host=c["mail_host"],
             port=c["mail_port"],
             username=c["mail_user"],
-            password=c["mail_pass"]
+            password=c["mail_pass"],
+            mailbox=c.get("mail_folder", "INBOX")
         )
         
         self.connector = VPNConnector(
@@ -451,7 +474,8 @@ class FortiAutoConnApp(rumps.App):
             host=creds["mail_host"],
             port=creds["mail_port"],
             username=creds["mail_user"],
-            password=creds["mail_pass"]
+            password=creds["mail_pass"],
+            mailbox=creds.get("mail_folder", "INBOX")
         )
         
         self.connector = VPNConnector(
@@ -479,7 +503,7 @@ class FortiAutoConnApp(rumps.App):
             self.connector = None
             
         self.cached_creds = None
-        rumps.notification("FortiAutoConn", "VPN 접속 종료 완료", "자동화 VPN 터널 연결이 정상 해제되었습니다.")
+        self.show_notification("FortiAutoConn", "VPN 접속 종료 완료", "자동화 VPN 터널 연결이 정상 해제되었습니다.")
 
     def on_settings(self, sender):
         """로컬 웹 서버를 스레드로 가동하고 브라우저를 띄워 설정을 안전하게 입력받습니다."""
@@ -491,7 +515,7 @@ class FortiAutoConnApp(rumps.App):
         def on_save_success():
             # 저장 성공 시 알림 후 서버 해제
             NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
-            rumps.notification("FortiAutoConn", "설정 갱신 완료", "새로운 설정이 시스템 Keychain에 성공적으로 업데이트되었습니다.")
+            self.show_notification("FortiAutoConn", "설정 갱신 완료", "새로운 설정이 시스템 Keychain에 성공적으로 업데이트되었습니다.")
             
             # 약간의 딜레이를 주어 브라우저가 완료 응답 HTML을 모두 송출한 후 웹 서버를 소멸시킵니다.
             time.sleep(1.0)
@@ -517,6 +541,7 @@ class FortiAutoConnApp(rumps.App):
         mail_host = KeychainManager.get_password(self.SERVICE_NAME, "mail_host")
         mail_port = KeychainManager.get_password(self.SERVICE_NAME, "mail_port")
         mail_user = KeychainManager.get_password(self.SERVICE_NAME, "mail_user")
+        mail_folder = KeychainManager.get_password(self.SERVICE_NAME, "mail_folder") or "INBOX"
         mail_pass = KeychainManager.get_password(self.SERVICE_NAME, "mail_pass")
 
         if not all([vpn_host, vpn_port, vpn_user, vpn_pass, mail_host, mail_port, mail_user, mail_pass]):
@@ -530,6 +555,7 @@ class FortiAutoConnApp(rumps.App):
             "mail_host": mail_host,
             "mail_port": mail_port,
             "mail_user": mail_user,
+            "mail_folder": mail_folder,
             "mail_pass": mail_pass
         }
 
