@@ -42,9 +42,10 @@ class SettingsHTTPServer:
                     vpn_port = KeychainManager.get_password(FortiAutoConnApp.SERVICE_NAME, "vpn_port") or "443"
                     vpn_user = KeychainManager.get_password(FortiAutoConnApp.SERVICE_NAME, "vpn_user") or ""
                     
-                    # 고급 옵션 로드
-                    vpn_dns_bypass = KeychainManager.get_password(FortiAutoConnApp.SERVICE_NAME, "vpn_dns_bypass") or "false"
-                    vpn_split_tunnel = KeychainManager.get_password(FortiAutoConnApp.SERVICE_NAME, "vpn_split_tunnel") or "false"
+                    # 고급 옵션 로드 (스플릿 터널링 + DNS 우회 기본 활성화:
+                    # 전체 터널링은 Claude/Codex 등 외부 서비스 접속 불가 증상을 유발하므로 기본값을 켜짐으로 유지)
+                    vpn_dns_bypass = KeychainManager.get_password(FortiAutoConnApp.SERVICE_NAME, "vpn_dns_bypass") or "true"
+                    vpn_split_tunnel = KeychainManager.get_password(FortiAutoConnApp.SERVICE_NAME, "vpn_split_tunnel") or "true"
                     vpn_split_routes = KeychainManager.get_password(FortiAutoConnApp.SERVICE_NAME, "vpn_split_routes") or "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16"
                     
                     mail_host = KeychainManager.get_password(FortiAutoConnApp.SERVICE_NAME, "mail_host") or "imap.daum.net"
@@ -771,10 +772,10 @@ class FortiAutoConnApp(rumps.App):
         vpn_user = KeychainManager.get_password(self.SERVICE_NAME, "vpn_user")
         vpn_pass = KeychainManager.get_password(self.SERVICE_NAME, "vpn_pass")
         
-        # 고급 옵션 로드
-        vpn_dns_bypass = KeychainManager.get_password(self.SERVICE_NAME, "vpn_dns_bypass") or "false"
-        vpn_split_tunnel = KeychainManager.get_password(self.SERVICE_NAME, "vpn_split_tunnel") or "false"
-        vpn_split_routes = KeychainManager.get_password(self.SERVICE_NAME, "vpn_split_routes") or ""
+        # 고급 옵션 로드 (설정 화면과 동일하게 스플릿 터널링 + DNS 우회가 기본값)
+        vpn_dns_bypass = KeychainManager.get_password(self.SERVICE_NAME, "vpn_dns_bypass") or "true"
+        vpn_split_tunnel = KeychainManager.get_password(self.SERVICE_NAME, "vpn_split_tunnel") or "true"
+        vpn_split_routes = KeychainManager.get_password(self.SERVICE_NAME, "vpn_split_routes") or "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16"
         
         mail_host = KeychainManager.get_password(self.SERVICE_NAME, "mail_host")
         mail_port = KeychainManager.get_password(self.SERVICE_NAME, "mail_port")
