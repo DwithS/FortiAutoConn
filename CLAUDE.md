@@ -17,7 +17,12 @@ Setup (installs `openfortivpn` via Homebrew, Python deps into `.venv`, and a pas
 
 Run the app:
 ```bash
-python3 app.py
+./run.sh        # picks .venv/bin/python3 if present, else system python3
+```
+
+Login auto-start (installs/removes a LaunchAgent at `~/Library/LaunchAgents/com.dailyfunding.fortiautoconn.plist`):
+```bash
+./autostart.sh install|uninstall|status
 ```
 
 Install/sync deps directly (uv is preferred; `uv.lock` is checked in):
