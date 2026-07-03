@@ -1,7 +1,10 @@
 import threading
 import pexpect
 import time
-import sys
+import re
+import subprocess
+import ipaddress
+from logger import logger
 
 class VPNConnector:
     STATUS_DISCONNECTED = "disconnected"
@@ -9,19 +12,39 @@ class VPNConnector:
     STATUS_CONNECTED = "connected"
     STATUS_FAILED = "failed"
 
-    def __init__(self, host, port, username, password, mail_checker, on_status_change=None):
+    # 재시도해도 해결되지 않는 실패 원인 코드.
+    # 이 값이 failure_reason에 세팅되면 App은 자동 재연결을 중단해 계정 접근제한(잠금)을 방지합니다.
+    REASON_MAIL_AUTH = "mail_auth"   # 메일 로그인 거부 (비밀번호/앱 비밀번호 오류)
+    REASON_VPN_AUTH = "vpn_auth"     # VPN 비밀번호 거부
+    REASON_SUDO = "sudo"             # sudoers NOPASSWD 미설정 (setup.sh 재실행 필요)
+    REASON_OTP = "otp"               # OTP 반복 거부
+
+    def __init__(self, host, port, username, password, mail_checker, on_status_change=None, dns_bypass=False, split_tunnel=False, split_routes=""):
         self.host = host
         self.port = port
         self.username = username
         self.password = password
         self.mail_checker = mail_checker
         self.on_status_change = on_status_change
-        
+
+        self.dns_bypass = dns_bypass
+        self.split_tunnel = split_tunnel
+        self.split_routes = split_routes
+
+        # 🛡️ 스플릿 터널링 시 회사 DNS 서버는 라우팅 대역 밖에 있어 도달 불가능한 경우가 대부분이며,
+        # 그 상태로 DNS가 회사 서버로 덮어써지면 모든 도메인 해석이 실패해
+        # '특정(사실상 모든) 인터넷 서비스가 안 되는' 증상이 발생합니다. → DNS 우회를 강제 동반 활성화.
+        if self.split_tunnel and not self.dns_bypass:
+            logger.info("[VPNConnector] 스플릿 터널링 활성 감지: 인터넷 끊김 방지를 위해 DNS 자동 변조 방지(우회)를 함께 활성화합니다.")
+            self.dns_bypass = True
+
         self.status = self.STATUS_DISCONNECTED
         self.process = None
         self.thread = None
         self._stop_event = threading.Event()
         self.trusted_cert = None # 자동 감지된 게이트웨이 인증서 해시 저장용
+        self.failure_reason = None
+        self._mail_verified = False  # 메일 로그인 사전 점검 통과 여부 (자가 복구 재시도 시 중복 점검 방지)
 
     def set_status(self, new_status):
         self.status = new_status
@@ -31,42 +54,73 @@ class VPNConnector:
     def start(self):
         """VPN 연결을 비동기 백그라운드 스레드로 시작합니다."""
         if self.status in [self.STATUS_CONNECTING, self.STATUS_CONNECTED]:
-            print("[VPNConnector] 이미 연결 시도 중이거나 연결된 상태입니다.")
+            logger.warning("[VPNConnector] 이미 연결 시도 중이거나 연결된 상태입니다.")
             return
 
         self._stop_event.clear()
+        self.failure_reason = None
         self.set_status(self.STATUS_CONNECTING)
         self.thread = threading.Thread(target=self._run_vpn, daemon=True)
         self.thread.start()
 
     def stop(self):
         """VPN 연결을 해제하고 프로세스를 정리합니다."""
-        print("[VPNConnector] VPN 연결 종료 프로세스 작동...")
+        logger.info("[VPNConnector] VPN 연결 종료 프로세스 작동...")
         self._stop_event.set()
-        
-        # openfortivpn 프로세스 강제 종료
+        self._terminate_process()
+        self.set_status(self.STATUS_DISCONNECTED)
+
+    def _terminate_process(self):
+        """openfortivpn 프로세스만 조용히 종료합니다 (상태 통지 없음)."""
         if self.process:
             try:
                 # pexpect child에 SIGTERM 전송
                 self.process.terminate(force=True)
             except Exception as e:
-                print(f"[VPNConnector] openfortivpn 프로세스 해제 에러: {e}")
-        
-        self.set_status(self.STATUS_DISCONNECTED)
+                logger.error(f"[VPNConnector] openfortivpn 프로세스 해제 에러: {e}")
+
+    def _fail(self, reason=None):
+        """
+        실패 처리 단일 경로: 프로세스를 정리한 뒤 FAILED 상태를 '한 번만' 통지합니다.
+        (stop() 호출로 DISCONNECTED가 먼저 통지되면 App의 자동 재연결이 이중 스케줄링되어
+         재시도 횟수가 두 배로 소진되고 알림이 중복 발생하는 문제가 있었음)
+        """
+        self.failure_reason = reason
+        self._stop_event.set()
+        self._terminate_process()
+        self.set_status(self.STATUS_FAILED)
 
     def _run_vpn(self):
-        import re
+        # 0. 메일 로그인 사전 점검: VPN에 비밀번호를 제출하는 순간 서버가 인증 메일을 발송하므로,
+        #    메일 자격 증명이 깨진 상태로 VPN 인증을 반복하면 [인증 메일 남발 + 메일 계정 접근제한]이
+        #    동시에 발생합니다. VPN 인증을 시작하기 전에 여기서 원천 차단합니다.
+        if not self._mail_verified:
+            if not self.mail_checker.verify_login():
+                logger.error("[VPNConnector] 메일 로그인 사전 점검 실패. 불필요한 인증 메일 발송을 막기 위해 VPN 인증을 시작하지 않습니다.")
+                self._fail(self.REASON_MAIL_AUTH)
+                return
+            self._mail_verified = True
 
         # 이미 자동 감지된 인증서 해시가 있다면 실행 인자에 포함하여 검증 에러 우회
         trusted_cert_flag = f" --trusted-cert {self.trusted_cert}" if self.trusted_cert else ""
-        cmd = f"sudo openfortivpn {self.host}:{self.port} -u {self.username}{trusted_cert_flag}"
-        print(f"[VPNConnector] openfortivpn 실행 명령: {cmd}")
+        dns_bypass_flag = " --pppd-no-peerdns --no-dns" if self.dns_bypass else ""
+        split_tunnel_flag = " --no-routes" if self.split_tunnel else ""
+
+        # sudo -n: sudoers(NOPASSWD) 미설정 시 조용히 비밀번호 입력을 기다리다
+        # 'Password:' 프롬프트에 VPN 비밀번호가 잘못 입력되는 사고를 막고 즉시 실패시킵니다.
+        cmd = f"sudo -n openfortivpn {self.host}:{self.port} -u {self.username}{trusted_cert_flag}{dns_bypass_flag}{split_tunnel_flag}"
+        logger.info(f"[VPNConnector] openfortivpn 실행 명령: {cmd}")
+
+        # 반복 제출 방지 카운터: 거부된 비밀번호/OTP를 계속 다시 보내면
+        # 인증 메일이 남발되고 VPN 계정이 잠기므로 횟수를 엄격히 제한합니다.
+        password_prompts = 0
+        otp_prompts = 0
 
         try:
             # pexpect를 사용한 터미널 프롬프트 실시간 제어
             # 인코딩 utf-8 설정 필수
             self.process = pexpect.spawn(cmd, encoding='utf-8', timeout=120)
-            
+
             # 감시할 패턴 정의
             # 0: 비밀번호 요구 프롬프트
             # 1: 2차 인증(OTP / 메일 인증) 코드 요구 프롬프트
@@ -85,57 +139,82 @@ class VPNConnector:
 
             while not self._stop_event.is_set():
                 index = self.process.expect(patterns, timeout=12)
-                
+
                 if index == 0:
-                    print("[VPNConnector] 1차 비밀번호 요구 프롬프트 감지. 암호 전송...")
+                    password_prompts += 1
+                    if password_prompts > 1:
+                        # 같은 비밀번호가 거부된 뒤 재요구된 상황 → 반복 제출은 계정 잠금을 유발하므로 즉시 중단
+                        logger.error("[VPNConnector] VPN 비밀번호가 거부되어 재요구되었습니다. 계정 잠금 방지를 위해 즉시 중단합니다.")
+                        self._fail(self.REASON_VPN_AUTH)
+                        return
+                    logger.info("[VPNConnector] 1차 비밀번호 요구 프롬프트 감지. 암호 전송...")
                     self.process.sendline(self.password)
-                    
+
                 elif index == 1:
-                    print("[VPNConnector] 2차 OTP 코드 요구 프롬프트 감지. 인증 메일 확인 중...")
+                    otp_prompts += 1
+                    if otp_prompts > 2:
+                        logger.error("[VPNConnector] OTP가 반복 거부되었습니다. 인증 메일 남발 방지를 위해 중단합니다.")
+                        self._fail(self.REASON_OTP)
+                        return
+                    logger.info("[VPNConnector] 2차 OTP 코드 요구 프롬프트 감지. 인증 메일 확인 중...")
                     # 1차 비밀번호 제출 후 다음/카카오 이메일로 발송된 최신 메일 OTP 조회
                     otp_code = self.mail_checker.fetch_latest_otp(max_wait_seconds=90)
                     if otp_code:
-                        print(f"[VPNConnector] 메일에서 파싱된 OTP 적용 입력: {otp_code}")
+                        logger.info(f"[VPNConnector] 메일에서 파싱된 OTP 적용 입력: {otp_code}")
                         self.process.sendline(otp_code)
                     else:
-                        print("[VPNConnector] 메일 수신 실패 또는 OTP 파싱 타임아웃. VPN 연결을 취소합니다.")
-                        self.stop()
-                        self.set_status(self.STATUS_FAILED)
+                        # 메일 로그인 거부가 원인이면 재시도해도 해결되지 않으므로 원인 코드를 전달
+                        reason = self.REASON_MAIL_AUTH if getattr(self.mail_checker, "auth_failed", False) else None
+                        logger.warning("[VPNConnector] 메일 수신 실패 또는 OTP 파싱 타임아웃. VPN 연결을 취소합니다.")
+                        self._fail(reason)
                         return
 
                 elif index == 2:
-                    print("[VPNConnector] 신뢰되지 않는 게이트웨이 인증서 경고 감지. 'y' 전송하여 자동 신뢰 허용...")
+                    logger.info("[VPNConnector] 신뢰되지 않는 게이트웨이 인증서 경고 감지. 'y' 전송하여 자동 신뢰 허용...")
                     self.process.sendline("y")
 
                 elif index == 3:
-                    print("[VPNConnector] VPN 터널 연결 성공! (Tunnel is up and running)")
+                    logger.info("[VPNConnector] VPN 터널 연결 성공! (Tunnel is up and running)")
+                    if self.split_tunnel:
+                        self._apply_split_routing()
                     self.set_status(self.STATUS_CONNECTED)
                     break
 
                 elif index == 4:
-                    output = self.process.before
-                    print(f"[VPNConnector] openfortivpn 프로세스가 초기 연결 중 예기치 않게 종료되었습니다.\n로그: {output}")
-                    
+                    output = self.process.before or ""
+                    logger.error(f"[VPNConnector] openfortivpn 프로세스가 초기 연결 중 예기치 않게 종료되었습니다.\n로그: {output}")
+
+                    # sudoers NOPASSWD 미설정 감지 (sudo -n이 즉시 거부한 경우)
+                    if "sudo:" in output and ("password is required" in output or "암호가 필요" in output):
+                        logger.error("[VPNConnector] sudo 무암호 권한이 설정되어 있지 않습니다. ./setup.sh 를 다시 실행해 주세요.")
+                        self._fail(self.REASON_SUDO)
+                        return
+
                     # 💡 핵심 자가 복구: 신뢰할 수 없는 사내 인증서 에러 감지 시 sha256 해시를 추출하여 자동 우회 재시도
                     if "Gateway certificate validation failed" in output or "trusted-cert" in output:
                         cert_match = re.search(r"(?:trusted-cert\s*=\s*|--trusted-cert\s+)([0-9a-fA-F]{64})", output)
                         if not cert_match:
                             cert_match = re.search(r"sha256 digest:\s*([0-9a-fA-F]{64})", output)
-                            
+
                         if cert_match:
                             detected_hash = cert_match.group(1)
                             # 중복 무한 재시도를 방지하기 위해 새로운 해시 감지 시에만 자동 갱신 및 재접속 구동
                             if detected_hash != self.trusted_cert:
-                                print(f"[VPNConnector] 🛡️ 신뢰되지 않는 사내 게이트웨이 인증서 해시 자동 검출: {detected_hash}")
-                                print("[VPNConnector] 해당 인증서를 화이트리스트에 임시 자동 추가하여 3초 후 안전 재접속을 구동합니다...")
+                                logger.info(f"[VPNConnector] 🛡️ 신뢰되지 않는 사내 게이트웨이 인증서 해시 자동 검출: {detected_hash}")
+                                logger.info("[VPNConnector] 해당 인증서를 화이트리스트에 임시 자동 추가하여 3초 후 안전 재접속을 구동합니다...")
                                 self.trusted_cert = detected_hash
                                 self.process.close()
                                 time.sleep(3)
                                 # 새로운 스레드로 무중단 자가 복구 연결 수행
                                 threading.Thread(target=self._run_vpn, daemon=True).start()
                                 return
-                                
-                    self.set_status(self.STATUS_FAILED)
+
+                    # 인증 실패로 종료된 경우는 재시도 금지 (반복 시 계정 잠금)
+                    if "Could not authenticate" in output or "Authentication failed" in output:
+                        self._fail(self.REASON_VPN_AUTH)
+                        return
+
+                    self._fail()
                     return
 
                 elif index == 5:
@@ -145,14 +224,65 @@ class VPNConnector:
             # VPN 연결이 수립(STATUS_CONNECTED)된 후 연결 수명 감시 루프
             while not self._stop_event.is_set():
                 if not self.process.isalive():
-                    print("[VPNConnector] VPN 터널 세션이 유실되었습니다 (프로세스 종료).")
+                    logger.warning("[VPNConnector] VPN 터널 세션이 유실되었습니다 (프로세스 종료).")
                     self.set_status(self.STATUS_DISCONNECTED)
                     break
-                
+
                 # 5초 간격으로 연결 활성화 지속 모니터링
                 time.sleep(5)
 
         except Exception as e:
-            print(f"[VPNConnector] VPN 구동 스레드 내부 오류: {e}")
-            self.set_status(self.STATUS_FAILED)
-            self.stop()
+            logger.error(f"[VPNConnector] VPN 구동 스레드 내부 오류: {e}")
+            self._fail()
+
+    def _get_active_ppp_interface(self, wait_seconds=10):
+        """
+        활성 ppp 인터페이스를 탐색합니다.
+        'Tunnel is up' 로그 직후에는 인터페이스가 아직 뜨는 중일 수 있으므로
+        잠시 재시도하며 대기합니다 (잘못된 인터페이스에 라우팅이 등록되는 것을 방지).
+        """
+        deadline = time.time() + wait_seconds
+        while True:
+            try:
+                res = subprocess.check_output(["ifconfig"], encoding="utf-8")
+                # ppp 인터페이스 중 UP, RUNNING 상태 스캔
+                interfaces = re.findall(r"(ppp\d+): flags=.*<UP,POINTOPOINT,RUNNING", res)
+                if interfaces:
+                    return interfaces[0]
+            except Exception as e:
+                logger.error(f"[VPNConnector] ppp 인터페이스 탐색 중 에러: {e}")
+
+            if time.time() >= deadline:
+                logger.warning("[VPNConnector] 활성 ppp 인터페이스를 찾지 못해 기본값 ppp0을 사용합니다.")
+                return "ppp0"  # 기본값 백업
+            time.sleep(0.5)
+
+    def _apply_split_routing(self):
+        if not self.split_routes:
+            logger.info("[VPNConnector] 스플릿 라우팅 대역이 비어 있어 등록을 생략합니다.")
+            return
+
+        ppp_if = self._get_active_ppp_interface()
+        routes = [r.strip() for r in self.split_routes.split(",") if r.strip()]
+
+        logger.info(f"[VPNConnector] 🛠️ 스플릿 터널링 가동: 인터페이스 {ppp_if} 기준으로 정적 라우팅을 등록합니다...")
+
+        has_error = False
+        for route in routes:
+            # 잘못된 형식의 대역이 route 명령에 들어가 라우팅 테이블이 오염되는 것을 방지
+            try:
+                ipaddress.ip_network(route, strict=False)
+            except ValueError:
+                logger.warning(f"[VPNConnector] ⚠️ 잘못된 IP 대역 형식이라 건너뜁니다: {route!r} (올바른 예: 10.0.0.0/8)")
+                has_error = True
+                continue
+
+            route_cmd = f"sudo -n route add -net {route} -interface {ppp_if}"
+            logger.info(f"[VPNConnector] 라우팅 테이블 등록 시도: {route_cmd}")
+            ret = subprocess.call(route_cmd, shell=True)
+            if ret != 0:
+                logger.warning(f"[VPNConnector] ⚠️ 라우팅 등록 실패(반환 코드 {ret}): {route_cmd}")
+                has_error = True
+
+        if has_error:
+            logger.warning("[VPNConnector] ⚠️ 일부 라우팅 추가에 실패했습니다. '/etc/sudoers.d/openfortivpn' 권한이 갱신되지 않았거나 (/sbin/route NOPASSWD 미등록), 이미 등록된 대역일 수 있습니다.")

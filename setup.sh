@@ -65,8 +65,8 @@ if [ -z "$OPENFORTIVPN_PATH" ]; then
     exit 1
 fi
 
-# sudoers 권한 규격 정의 (admin 그룹의 사용자가 비밀번호 없이 해당 경로 바이너리 실행 허용)
-SUDOERS_LINE="%admin ALL=(ALL) NOPASSWD: $OPENFORTIVPN_PATH"
+# sudoers 권한 규격 정의 (admin 그룹의 사용자가 비밀번호 없이 openfortivpn 및 route 명령을 실행하도록 허용)
+SUDOERS_LINE="%admin ALL=(ALL) NOPASSWD: $OPENFORTIVPN_PATH, /sbin/route"
 SUDOERS_FILE="/etc/sudoers.d/openfortivpn"
 
 echo -e "메뉴바 백그라운드 앱이 8시간 만료 및 최초 연결 시 무중단 연동을 위해 openfortivpn을 관리자 권한으로 호출할 수 있게 설정합니다."
