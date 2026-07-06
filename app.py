@@ -601,7 +601,14 @@ class FortiAutoConnApp(rumps.App):
         
         # 초기 버튼 상태 지정 (연결되지 않았을 때는 Disconnect 비활성화)
         self.menu_disconnect.set_callback(None)
-        
+
+        # 💡 rumps는 quit_button(기본 'Quit') 클릭 시 rumps.quit_application() → 순수 Cocoa
+        # NSApplication.terminate_()만 호출하며, App 서브클래스의 커스텀 메서드를 자동으로 불러주지
+        # 않습니다. before_quit 이벤트(= applicationWillTerminate_에서 발생, Quit 메뉴/Cmd+Q/외부
+        # SIGTERM으로 인한 NSApplication.terminate_ 호출을 모두 포함)에 명시적으로 등록해야만
+        # VPN 연결 정리(self.terminate)가 실제로 실행됩니다.
+        rumps.events.before_quit.register(self.terminate)
+
         self.connector = None
         self.cached_creds = None      # 백그라운드 자동 재연결을 위해 메모리에만 세션 안전하게 유지
         self.auto_reconnect_enabled = False
@@ -892,8 +899,14 @@ class FortiAutoConnApp(rumps.App):
         }
 
     def terminate(self):
-        """애플리케이션 종료 시 터미널 정리 및 프로세스 안전 해제"""
-        logger.info("[App] FortiAutoConnApp terminate() 호출됨. 전체 백그라운드 리소스 파기 중...")
+        """
+        VPN 터널과 설정 웹서버 등 백그라운드 리소스를 정리합니다. 두 경로에서 호출됩니다:
+        (1) Quit 메뉴 클릭/Cmd+Q → rumps의 before_quit 이벤트(__init__에서 등록) → 이 메서드
+        (2) 외부 SIGTERM/SIGINT(kill, launchctl bootout 등) → 아래 _handle_termination_signal이 직접 호출
+        rumps.App은 자체 terminate() 메서드를 정의하지 않으므로 이 메서드는 오버라이드가
+        아닙니다 — super().terminate() 같은 호출을 추가하지 마세요.
+        """
+        logger.info("[App] 앱 종료 절차 시작. 백그라운드 리소스 정리 중...")
         self.auto_reconnect_enabled = False
         if self.reconnect_timer:
             self.reconnect_timer.cancel()
@@ -901,17 +914,47 @@ class FortiAutoConnApp(rumps.App):
             self.connector.stop()
         if self.settings_server:
             self.settings_server.stop()
-        logger.info("[App] 파기 완료. 프로그램을 종료합니다.")
-        super(FortiAutoConnApp, self).terminate()
+        logger.info("[App] 리소스 정리 완료.")
 
-def sigint_handler(sig, frame):
-    logger.info("[FortiAutoConn] 사용자에 의해 강제 종료 시그널(SIGINT)이 감지되었습니다. 즉시 완전히 종료합니다.")
-    # 터널에서 Ctrl+C를 눌렀을 때 루프 대기 없이 즉각적으로 완벽하게 사멸 처리
-    os._exit(0)
+_app_instance = None
+
+def _handle_termination_signal(signum):
+    """
+    SIGTERM(kill, launchctl bootout 등)/SIGINT(Ctrl+C) 처리. FortiAutoConnApp.terminate()를
+    직접 호출해 Quit 메뉴 클릭과 동일한 정리 로직(VPN 터널 종료 등)을 재사용합니다.
+
+    💡 왜 signal.signal()이 아니라 PyObjCTools.MachSignals를 쓰는가:
+    rumps 앱은 대부분의 시간을 Cocoa 런루프(AppHelper.runEventLoop) 안에서 블로킹 상태로
+    보내는데, 그 안에서는 일반 Python signal.signal() 핸들러가 즉시 실행되지 않고 런루프가
+    우연히 파이썬 바이트코드로 제어를 넘길 때까지 지연됩니다 (실측 결과 최대 수 분까지 지연).
+    MachSignals는 시그널을 Mach 메시지로 런루프에 직접 전달해 즉시 깨웁니다 — rumps가 SIGINT
+    처리에 내부적으로 쓰는 것과 동일한 메커니즘입니다.
+
+    💡 왜 NSApplication.terminate_()를 쓰지 않는가:
+    그 경로는 항상 종료 코드 0(정상 종료)으로 끝나서, autostart.sh의 LaunchAgent
+    (KeepAlive.SuccessfulExit=false)가 "정상 Quit"과 "외부 강제 종료(크래시로 간주해
+    자동 재기동해야 함)"를 구분할 수 없게 만듭니다. 그래서 여기서는 정리 로직만 재사용하고
+    종료는 os._exit()으로 직접, 비0 코드로 수행합니다.
+    """
+    logger.info(f"[FortiAutoConn] 종료 시그널({signum}) 감지. VPN을 정리하고 종료합니다.")
+    if _app_instance is not None:
+        try:
+            _app_instance.terminate()
+        except Exception as e:
+            logger.error(f"[FortiAutoConn] 종료 정리 중 오류: {e}")
+    os._exit(1)
+
+def _install_termination_signal_handlers():
+    from PyObjCTools import MachSignals
+    MachSignals.signal(signal.SIGTERM, _handle_termination_signal)
+    # rumps가 app.run() 내부(installMachInterrupt)에서 SIGINT용 Mach 핸들러를 자체 등록하므로,
+    # 이 함수는 rumps.events.before_start(런루프 진입 '직전', installMachInterrupt '이후')에
+    # 실행되도록 등록해 우리 핸들러로 다시 덮어써서 SIGINT도 확실히 가로챕니다.
+    MachSignals.signal(signal.SIGINT, _handle_termination_signal)
 
 if __name__ == "__main__":
-    # Ctrl+C 시그널 핸들러 연결
-    signal.signal(signal.SIGINT, sigint_handler)
-    
+    rumps.events.before_start.register(_install_termination_signal_handlers)
+
     app = FortiAutoConnApp()
+    _app_instance = app
     app.run()
