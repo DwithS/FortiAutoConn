@@ -44,6 +44,7 @@ class VPNConnector:
         self._stop_event = threading.Event()
         self.trusted_cert = None # 자동 감지된 게이트웨이 인증서 해시 저장용
         self.failure_reason = None
+        self._active_ppp_if = None  # 연결 성공 시 확인된 실제 ppp 인터페이스명 (수명 감시에 재사용)
         self._mail_verified = False  # 메일 로그인 사전 점검 통과 여부 (자가 복구 재시도 시 중복 점검 방지)
 
     def set_status(self, new_status):
@@ -175,8 +176,10 @@ class VPNConnector:
 
                 elif index == 3:
                     logger.info("[VPNConnector] VPN 터널 연결 성공! (Tunnel is up and running)")
+                    # 이후 수명 감시(health check)에서도 재사용할 실제 ppp 인터페이스를 여기서 한 번만 확인
+                    self._active_ppp_if = self._get_active_ppp_interface()
                     if self.split_tunnel:
-                        self._apply_split_routing()
+                        self._apply_split_routing(self._active_ppp_if)
                     self.set_status(self.STATUS_CONNECTED)
                     break
 
@@ -222,9 +225,21 @@ class VPNConnector:
                     pass
 
             # VPN 연결이 수립(STATUS_CONNECTED)된 후 연결 수명 감시 루프
+            #
+            # 💡 핵심 버그 수정: self.process는 pexpect가 감시하는 'sudo openfortivpn' 래퍼 프로세스인데,
+            # 실제 터널을 담당하는 openfortivpn/pppd 자식 프로세스가 죽어도(세션 만료 등) sudo 래퍼 자체는
+            # 자식을 회수(reap)하지 못한 채(좀비) 계속 살아있을 수 있습니다. 이 경우 isalive()만 보면
+            # 터널이 실제로는 끊겼는데도 영원히 '연결됨(🟢)'으로 오판하게 됩니다.
+            # → 자식 프로세스 생존 여부와 별개로, 실제 ppp 인터페이스가 UP/RUNNING 상태인지도 함께 확인합니다.
             while not self._stop_event.is_set():
-                if not self.process.isalive():
-                    logger.warning("[VPNConnector] VPN 터널 세션이 유실되었습니다 (프로세스 종료).")
+                process_alive = self.process.isalive()
+                tunnel_up = self._is_ppp_interface_up(self._active_ppp_if)
+
+                if not process_alive or not tunnel_up:
+                    logger.warning(
+                        f"[VPNConnector] VPN 터널 세션이 유실되었습니다 "
+                        f"(프로세스 생존: {process_alive}, ppp 인터페이스({self._active_ppp_if}) 정상: {tunnel_up})."
+                    )
                     self.set_status(self.STATUS_DISCONNECTED)
                     break
 
@@ -257,12 +272,33 @@ class VPNConnector:
                 return "ppp0"  # 기본값 백업
             time.sleep(0.5)
 
-    def _apply_split_routing(self):
+    def _is_ppp_interface_up(self, ifname):
+        """
+        지정된 ppp 인터페이스가 여전히 UP/RUNNING 상태인지 확인합니다.
+        openfortivpn/pppd 자식 프로세스가 죽으면 이 인터페이스도 함께 사라지므로,
+        pexpect가 감시하는 'sudo' 래퍼 프로세스의 생존 여부만으로는 잡아낼 수 없는
+        '자식만 죽고 부모(sudo)는 좀비 상태로 살아있는' 상황을 탐지하는 용도입니다.
+        """
+        if not ifname:
+            return False
+        try:
+            res = subprocess.check_output(["ifconfig", ifname], encoding="utf-8", stderr=subprocess.DEVNULL)
+            return bool(re.search(r"flags=.*<UP,POINTOPOINT,RUNNING", res))
+        except subprocess.CalledProcessError:
+            # 인터페이스 자체가 더 이상 존재하지 않음 (터널 소멸)
+            return False
+        except Exception as e:
+            logger.error(f"[VPNConnector] ppp 인터페이스({ifname}) 상태 확인 중 에러: {e}")
+            # 확인 자체가 실패한 경우는 네트워크 명령어 문제일 수 있으므로 오탐(불필요한 재연결)을 피하기 위해 생존으로 간주
+            return True
+
+    def _apply_split_routing(self, ppp_if=None):
         if not self.split_routes:
             logger.info("[VPNConnector] 스플릿 라우팅 대역이 비어 있어 등록을 생략합니다.")
             return
 
-        ppp_if = self._get_active_ppp_interface()
+        if not ppp_if:
+            ppp_if = self._get_active_ppp_interface()
         routes = [r.strip() for r in self.split_routes.split(",") if r.strip()]
 
         logger.info(f"[VPNConnector] 🛠️ 스플릿 터널링 가동: 인터페이스 {ppp_if} 기준으로 정적 라우팅을 등록합니다...")
