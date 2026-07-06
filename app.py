@@ -2,6 +2,7 @@ import rumps
 import os
 import sys
 import time
+import json
 import threading
 import webbrowser
 import signal
@@ -37,21 +38,22 @@ class SettingsHTTPServer:
                     self.send_header("Content-type", "text/html; charset=utf-8")
                     self.end_headers()
                     
-                    # 키체인에서 암호화 저장된 최신 값 로드 (보안 강화)
-                    vpn_host = KeychainManager.get_password(FortiAutoConnApp.SERVICE_NAME, "vpn_host") or ""
-                    vpn_port = KeychainManager.get_password(FortiAutoConnApp.SERVICE_NAME, "vpn_port") or "443"
-                    vpn_user = KeychainManager.get_password(FortiAutoConnApp.SERVICE_NAME, "vpn_user") or ""
-                    
+                    # 키체인의 단일 통합 설정 항목에서 최신 값 로드 (보안 강화)
+                    config = FortiAutoConnApp.load_config()
+                    vpn_host = config.get("vpn_host") or ""
+                    vpn_port = config.get("vpn_port") or "443"
+                    vpn_user = config.get("vpn_user") or ""
+
                     # 고급 옵션 로드 (스플릿 터널링 + DNS 우회 기본 활성화:
                     # 전체 터널링은 Claude/Codex 등 외부 서비스 접속 불가 증상을 유발하므로 기본값을 켜짐으로 유지)
-                    vpn_dns_bypass = KeychainManager.get_password(FortiAutoConnApp.SERVICE_NAME, "vpn_dns_bypass") or "true"
-                    vpn_split_tunnel = KeychainManager.get_password(FortiAutoConnApp.SERVICE_NAME, "vpn_split_tunnel") or "true"
-                    vpn_split_routes = KeychainManager.get_password(FortiAutoConnApp.SERVICE_NAME, "vpn_split_routes") or "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16"
-                    
-                    mail_host = KeychainManager.get_password(FortiAutoConnApp.SERVICE_NAME, "mail_host") or "imap.daum.net"
-                    mail_port = KeychainManager.get_password(FortiAutoConnApp.SERVICE_NAME, "mail_port") or "993"
-                    mail_user = KeychainManager.get_password(FortiAutoConnApp.SERVICE_NAME, "mail_user") or ""
-                    mail_folder = KeychainManager.get_password(FortiAutoConnApp.SERVICE_NAME, "mail_folder") or "INBOX"
+                    vpn_dns_bypass = config.get("vpn_dns_bypass") or "true"
+                    vpn_split_tunnel = config.get("vpn_split_tunnel") or "true"
+                    vpn_split_routes = config.get("vpn_split_routes") or "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16"
+
+                    mail_host = config.get("mail_host") or "imap.daum.net"
+                    mail_port = config.get("mail_port") or "993"
+                    mail_user = config.get("mail_user") or ""
+                    mail_folder = config.get("mail_folder") or "INBOX"
 
                     dns_checked = "checked" if vpn_dns_bypass == "true" else ""
                     split_checked = "checked" if vpn_split_tunnel == "true" else ""
@@ -493,7 +495,47 @@ class SettingsHTTPServer:
 
 class FortiAutoConnApp(rumps.App):
     SERVICE_NAME = "FortiAutoConn"
-    
+    # 모든 설정을 이 계정명 하나의 keychain 항목(JSON)에 통합 저장합니다.
+    # macOS는 keychain 항목마다 개별적으로 앱 접근 승인을 요구하는데, 예전 버전처럼 필드별로
+    # 12개의 개별 항목을 쓰면 앱 서명이 바뀔 때마다(예: forti-auto 서명 적용) 승인 팝업이 12번 뜹니다.
+    # 항목을 1개로 합쳐 이 팝업이 한 번만 뜨도록 합니다.
+    CONFIG_ACCOUNT = "config"
+    # 예전 버전(필드별 개별 keychain 항목)과의 호환을 위한 마이그레이션 대상 필드 목록
+    LEGACY_FIELDS = [
+        "vpn_host", "vpn_port", "vpn_user", "vpn_pass",
+        "vpn_dns_bypass", "vpn_split_tunnel", "vpn_split_routes",
+        "mail_host", "mail_port", "mail_user", "mail_folder", "mail_pass",
+    ]
+
+    @classmethod
+    def load_config(cls):
+        """단일 JSON keychain 항목에서 전체 설정을 로드 (없으면 예전 방식에서 1회 자동 마이그레이션)."""
+        raw = KeychainManager.get_password(cls.SERVICE_NAME, cls.CONFIG_ACCOUNT)
+        if raw:
+            try:
+                return json.loads(raw)
+            except (ValueError, TypeError):
+                logger.error("[App] 저장된 설정 JSON 파싱 실패. 빈 설정으로 처리합니다.")
+
+        legacy = {f: KeychainManager.get_password(cls.SERVICE_NAME, f) for f in cls.LEGACY_FIELDS}
+        legacy = {k: v for k, v in legacy.items() if v is not None}
+        if legacy:
+            logger.info("[App] 예전 방식(필드별 개별 keychain 항목)의 설정을 단일 항목으로 통합 마이그레이션합니다.")
+            cls.save_config(legacy)
+        return legacy
+
+    @classmethod
+    def save_config(cls, updates):
+        """기존 설정과 병합하여 단일 JSON keychain 항목에 저장 (부분 갱신 지원)."""
+        raw = KeychainManager.get_password(cls.SERVICE_NAME, cls.CONFIG_ACCOUNT)
+        try:
+            config = json.loads(raw) if raw else {}
+        except (ValueError, TypeError):
+            config = {}
+        config.update(updates)
+        KeychainManager.save_password(cls.SERVICE_NAME, cls.CONFIG_ACCOUNT, json.dumps(config))
+        return config
+
     def __init__(self):
         # 🔴 상태로 최초 아이콘 로드 (메뉴바 상주용)
         super(FortiAutoConnApp, self).__init__(name="FortiAutoConn", title="🔴")

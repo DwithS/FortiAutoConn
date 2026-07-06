@@ -19,18 +19,54 @@ PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 GUI_DOMAIN="gui/$(id -u)"
 
 # 가상환경 파이썬 우선 사용 (setup.sh가 만든 .venv), 없으면 시스템 python3
-PYTHON_BIN="$PROJECT_DIR/.venv/bin/python3"
-if [ ! -x "$PYTHON_BIN" ]; then
-    PYTHON_BIN="$(command -v python3)"
+if [ -x "$PROJECT_DIR/.venv/bin/python3" ]; then
+    PY_DIR="$PROJECT_DIR/.venv/bin"
+    PY_ORIG="$PROJECT_DIR/.venv/bin/python3"
+else
+    PY_DIR="$PROJECT_DIR/.bin"
+    PY_ORIG="$(command -v python3)"
 fi
+# 💡 macOS Touch ID / 암호 인증 팝업에 'python3.12' 대신 'forti-auto'로 표시되도록
+# 실제 인터프리터를 '독립된 복사본'으로 떠서 우리만의 코드서명 identifier를 부여합니다.
+PYTHON_BIN="$PY_DIR/forti-auto"
 
 install_agent() {
-    if [ -z "$PYTHON_BIN" ]; then
+    if [ -z "$PY_ORIG" ]; then
         echo -e "${RED}python3를 찾을 수 없습니다. 먼저 ./setup.sh 를 실행해 주세요.${NC}"
         exit 1
     fi
 
-    mkdir -p "$HOME/Library/LaunchAgents" "$PROJECT_DIR/logs"
+    mkdir -p "$HOME/Library/LaunchAgents" "$PROJECT_DIR/logs" "$PY_DIR"
+
+    REAL="$(readlink -f "$PY_ORIG" 2>/dev/null)"
+    if [ -z "$REAL" ]; then
+        REAL="$("$PY_ORIG" -c "import os,sys; print(os.path.realpath(sys.executable))")"
+    fi
+
+    # macOS는 프로세스 이름이 아니라 코드서명 identifier로 요청 앱을 판별하므로,
+    # 단순 심볼릭 링크로는 표시 이름이 바뀌지 않습니다. 반드시 '실제 파일 복사본'이어야 하며,
+    # 절대 원본 공용 인터프리터 파일에 직접 서명해서는 안 됩니다 (다른 프로젝트/venv가 공유할 수 있음).
+    if [ ! -x "$PYTHON_BIN" ] || [ "$REAL" -nt "$PYTHON_BIN" ]; then
+        rm -f "$PYTHON_BIN"   # 예전 버전이 심볼릭 링크였을 수 있으므로 반드시 먼저 제거
+        cp -f "$REAL" "$PYTHON_BIN"
+        codesign --force --sign - --identifier "com.dailyfunding.forti-auto" "$PYTHON_BIN" 2>/dev/null
+
+        REAL_LIB_DIR="$(dirname "$(dirname "$REAL")")/lib"
+        LAUNCHER_LIB_DIR="$(dirname "$PY_DIR")/lib"
+        if [ -d "$REAL_LIB_DIR" ]; then
+            mkdir -p "$LAUNCHER_LIB_DIR"
+            for dylib in "$REAL_LIB_DIR"/libpython*.dylib; do
+                [ -e "$dylib" ] || continue
+                ln -sf "$dylib" "$LAUNCHER_LIB_DIR/$(basename "$dylib")"
+            done
+        fi
+    fi
+
+    # 구성이 실패했거나 실행 불가능한 환경이면 이름 커스터마이징 없이 원본으로 안전하게 폴백
+    if [ ! -x "$PYTHON_BIN" ] || ! "$PYTHON_BIN" -c "" 2>/dev/null; then
+        echo -e "${YELLOW}'forti-auto' 실행 환경 구성 실패, 기본 인터프리터로 등록합니다.${NC}"
+        PYTHON_BIN="$REAL"
+    fi
 
     # launchd는 PATH를 거의 비워둔 채 앱을 띄우므로, Homebrew 경로(openfortivpn 위치)를
     # 명시적으로 넣어주지 않으면 자동실행으로 뜬 앱이 openfortivpn을 찾지 못합니다.
