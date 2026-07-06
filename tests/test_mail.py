@@ -1,5 +1,6 @@
 import sys
 import os
+import json
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from keychain_manager import KeychainManager
@@ -12,12 +13,14 @@ def test_mail_connection():
     print("      Daum/Kakao IMAP 로그인 & OTP 감시 테스트")
     print("==============================================")
     
-    # 키체인에서 정보 로드
+    # 키체인의 단일 통합 설정 항목(app.py의 FortiAutoConnApp.CONFIG_ACCOUNT)에서 정보 로드
     vpn_svc = "FortiAutoConn"
-    mail_host = KeychainManager.get_password(vpn_svc, "mail_host")
-    mail_port = KeychainManager.get_password(vpn_svc, "mail_port")
-    mail_user = KeychainManager.get_password(vpn_svc, "mail_user")
-    mail_pass = KeychainManager.get_password(vpn_svc, "mail_pass")
+    raw_config = KeychainManager.get_password(vpn_svc, "config")
+    config = json.loads(raw_config) if raw_config else {}
+    mail_host = config.get("mail_host")
+    mail_port = config.get("mail_port")
+    mail_user = config.get("mail_user")
+    mail_pass = config.get("mail_pass")
 
     if not all([mail_host, mail_port, mail_user, mail_pass]):
         logger.warning("[Test] 키체인에 등록된 메일 정보가 일부 누락되어 테스트 불가.")

@@ -407,32 +407,29 @@ class SettingsHTTPServer:
                     # 파라미터 값 추출
                     data = {k: v[0].strip() for k, v in params.items()}
 
-                    # 안전하게 키체인에 대칭 암호화 저장
-                    KeychainManager.save_password(FortiAutoConnApp.SERVICE_NAME, "vpn_host", data.get("vpn_host", ""))
-                    KeychainManager.save_password(FortiAutoConnApp.SERVICE_NAME, "vpn_port", data.get("vpn_port", ""))
-                    KeychainManager.save_password(FortiAutoConnApp.SERVICE_NAME, "vpn_user", data.get("vpn_user", ""))
-                    
-                    # 💡 비밀번호가 입력된 경우에만 키체인 갱신 (입력하지 않으면 기존 비밀번호 안전하게 보존)
-                    new_vpn_pass = data.get("vpn_pass", "")
-                    if new_vpn_pass:
-                        KeychainManager.save_password(FortiAutoConnApp.SERVICE_NAME, "vpn_pass", new_vpn_pass)
-                    
-                    # 고급 옵션 저장 (체크박스는 선택 해제 시 post 데이터에 없으므로 기본값 처리)
+                    # 고급 옵션 계산 (체크박스는 선택 해제 시 post 데이터에 없으므로 기본값 처리)
                     split_val = "true" if data.get("vpn_split_tunnel", "false") == "true" else "false"
                     # 스플릿 터널링 활성 시 DNS 우회 필수 동반 (회사 DNS 도달 불가로 인터넷 전체가 끊기는 것 방지)
                     dns_val = "true" if (data.get("vpn_dns_bypass", "false") == "true" or split_val == "true") else "false"
-                    KeychainManager.save_password(FortiAutoConnApp.SERVICE_NAME, "vpn_dns_bypass", dns_val)
-                    KeychainManager.save_password(FortiAutoConnApp.SERVICE_NAME, "vpn_split_tunnel", split_val)
-                    KeychainManager.save_password(FortiAutoConnApp.SERVICE_NAME, "vpn_split_routes", data.get("vpn_split_routes", ""))
 
-                    KeychainManager.save_password(FortiAutoConnApp.SERVICE_NAME, "mail_host", data.get("mail_host", ""))
-                    KeychainManager.save_password(FortiAutoConnApp.SERVICE_NAME, "mail_port", data.get("mail_port", ""))
-                    KeychainManager.save_password(FortiAutoConnApp.SERVICE_NAME, "mail_user", data.get("mail_user", ""))
-                    KeychainManager.save_password(FortiAutoConnApp.SERVICE_NAME, "mail_folder", data.get("mail_folder", "INBOX"))
-                    
-                    new_mail_pass = data.get("mail_pass", "")
-                    if new_mail_pass:
-                        KeychainManager.save_password(FortiAutoConnApp.SERVICE_NAME, "mail_pass", new_mail_pass)
+                    # 안전하게 키체인의 단일 통합 항목에 병합 저장 (비밀번호는 입력된 경우에만 갱신 - 빈 칸이면 기존 값 보존)
+                    updates = {
+                        "vpn_host": data.get("vpn_host", ""),
+                        "vpn_port": data.get("vpn_port", ""),
+                        "vpn_user": data.get("vpn_user", ""),
+                        "vpn_dns_bypass": dns_val,
+                        "vpn_split_tunnel": split_val,
+                        "vpn_split_routes": data.get("vpn_split_routes", ""),
+                        "mail_host": data.get("mail_host", ""),
+                        "mail_port": data.get("mail_port", ""),
+                        "mail_user": data.get("mail_user", ""),
+                        "mail_folder": data.get("mail_folder", "INBOX"),
+                    }
+                    if data.get("vpn_pass", ""):
+                        updates["vpn_pass"] = data["vpn_pass"]
+                    if data.get("mail_pass", ""):
+                        updates["mail_pass"] = data["mail_pass"]
+                    FortiAutoConnApp.save_config(updates)
 
                     # 성공 안내 페이지 송출
                     self.send_response(200)
@@ -808,22 +805,23 @@ class FortiAutoConnApp(rumps.App):
         webbrowser.open("http://127.0.0.1:18372/")
 
     def _load_credentials_from_keychain(self):
-        """키체인 보안 풀에서 설정 정보 로드"""
-        vpn_host = KeychainManager.get_password(self.SERVICE_NAME, "vpn_host")
-        vpn_port = KeychainManager.get_password(self.SERVICE_NAME, "vpn_port")
-        vpn_user = KeychainManager.get_password(self.SERVICE_NAME, "vpn_user")
-        vpn_pass = KeychainManager.get_password(self.SERVICE_NAME, "vpn_pass")
-        
+        """키체인의 단일 통합 설정 항목에서 자격 증명 로드"""
+        config = self.load_config()
+        vpn_host = config.get("vpn_host")
+        vpn_port = config.get("vpn_port")
+        vpn_user = config.get("vpn_user")
+        vpn_pass = config.get("vpn_pass")
+
         # 고급 옵션 로드 (설정 화면과 동일하게 스플릿 터널링 + DNS 우회가 기본값)
-        vpn_dns_bypass = KeychainManager.get_password(self.SERVICE_NAME, "vpn_dns_bypass") or "true"
-        vpn_split_tunnel = KeychainManager.get_password(self.SERVICE_NAME, "vpn_split_tunnel") or "true"
-        vpn_split_routes = KeychainManager.get_password(self.SERVICE_NAME, "vpn_split_routes") or "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16"
-        
-        mail_host = KeychainManager.get_password(self.SERVICE_NAME, "mail_host")
-        mail_port = KeychainManager.get_password(self.SERVICE_NAME, "mail_port")
-        mail_user = KeychainManager.get_password(self.SERVICE_NAME, "mail_user")
-        mail_folder = KeychainManager.get_password(self.SERVICE_NAME, "mail_folder") or "INBOX"
-        mail_pass = KeychainManager.get_password(self.SERVICE_NAME, "mail_pass")
+        vpn_dns_bypass = config.get("vpn_dns_bypass") or "true"
+        vpn_split_tunnel = config.get("vpn_split_tunnel") or "true"
+        vpn_split_routes = config.get("vpn_split_routes") or "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16"
+
+        mail_host = config.get("mail_host")
+        mail_port = config.get("mail_port")
+        mail_user = config.get("mail_user")
+        mail_folder = config.get("mail_folder") or "INBOX"
+        mail_pass = config.get("mail_pass")
 
         if not all([vpn_host, vpn_port, vpn_user, vpn_pass, mail_host, mail_port, mail_user, mail_pass]):
             return None
