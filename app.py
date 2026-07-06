@@ -492,11 +492,13 @@ class SettingsHTTPServer:
 
 class FortiAutoConnApp(rumps.App):
     SERVICE_NAME = "FortiAutoConn"
-    # 모든 설정을 이 계정명 하나의 keychain 항목(JSON)에 통합 저장합니다.
-    # macOS는 keychain 항목마다 개별적으로 앱 접근 승인을 요구하는데, 예전 버전처럼 필드별로
-    # 12개의 개별 항목을 쓰면 앱 서명이 바뀔 때마다(예: forti-auto 서명 적용) 승인 팝업이 12번 뜹니다.
-    # 항목을 1개로 합쳐 이 팝업이 한 번만 뜨도록 합니다.
+    # 🔐 진짜 비밀(비밀번호)만 Keychain에 저장하고, 호스트/포트/사용자명/폴더/DNS·스플릿터널
+    # 옵션처럼 민감하지 않은 값은 평범한 로컬 설정 파일에 저장합니다. Keychain 항목을
+    # 최소화하면 macOS의 '앱 접근 승인' 팝업도 딱 이 하나(비밀번호 묶음)로만 뜨게 됩니다.
     CONFIG_ACCOUNT = "config"
+    SECRET_FIELDS = {"vpn_pass", "mail_pass"}
+    CONFIG_DIR = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "FortiAutoConn")
+    CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
     # 예전 버전(필드별 개별 keychain 항목)과의 호환을 위한 마이그레이션 대상 필드 목록
     LEGACY_FIELDS = [
         "vpn_host", "vpn_port", "vpn_user", "vpn_pass",
@@ -505,33 +507,81 @@ class FortiAutoConnApp(rumps.App):
     ]
 
     @classmethod
-    def load_config(cls):
-        """단일 JSON keychain 항목에서 전체 설정을 로드 (없으면 예전 방식에서 1회 자동 마이그레이션)."""
-        raw = KeychainManager.get_password(cls.SERVICE_NAME, cls.CONFIG_ACCOUNT)
-        if raw:
-            try:
-                return json.loads(raw)
-            except (ValueError, TypeError):
-                logger.error("[App] 저장된 설정 JSON 파싱 실패. 빈 설정으로 처리합니다.")
+    def _read_local_config(cls):
+        try:
+            with open(cls.CONFIG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (FileNotFoundError, ValueError):
+            return {}
 
-        legacy = {f: KeychainManager.get_password(cls.SERVICE_NAME, f) for f in cls.LEGACY_FIELDS}
-        legacy = {k: v for k, v in legacy.items() if v is not None}
-        if legacy:
-            logger.info("[App] 예전 방식(필드별 개별 keychain 항목)의 설정을 단일 항목으로 통합 마이그레이션합니다.")
-            cls.save_config(legacy)
-        return legacy
+    @classmethod
+    def _write_local_config(cls, data):
+        os.makedirs(cls.CONFIG_DIR, exist_ok=True)
+        with open(cls.CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.chmod(cls.CONFIG_FILE, 0o600)  # 본인 계정만 읽기/쓰기 가능하도록 권한 제한
+
+    @classmethod
+    def _read_secret_config(cls):
+        raw = KeychainManager.get_password(cls.SERVICE_NAME, cls.CONFIG_ACCOUNT)
+        try:
+            return json.loads(raw) if raw else {}
+        except (ValueError, TypeError):
+            return {}
+
+    @classmethod
+    def _write_secret_config(cls, data):
+        KeychainManager.save_password(cls.SERVICE_NAME, cls.CONFIG_ACCOUNT, json.dumps(data))
+
+    @classmethod
+    def load_config(cls):
+        """비민감 설정은 로컬 파일에서, 비밀번호는 Keychain에서 읽어 하나로 합칩니다."""
+        local = cls._read_local_config()
+        secret = cls._read_secret_config()
+        if local or secret:
+            merged = dict(local)
+            merged.update(secret)
+            return merged
+
+        # 로컬 파일도 새 Keychain 항목도 없다면: 예전 버전에서 1회 마이그레이션 시도
+        # (1) 비밀/비민감 값이 한 Keychain 항목에 섞여 있던 방식, (2) 더 예전의 필드별 개별 항목
+        legacy_raw = KeychainManager.get_password(cls.SERVICE_NAME, cls.CONFIG_ACCOUNT)
+        try:
+            legacy = json.loads(legacy_raw) if legacy_raw else {}
+        except (ValueError, TypeError):
+            legacy = {}
+
+        if not legacy:
+            legacy = {f: KeychainManager.get_password(cls.SERVICE_NAME, f) for f in cls.LEGACY_FIELDS}
+            legacy = {k: v for k, v in legacy.items() if v is not None}
+            if legacy:
+                # 마이그레이션 완료 후 예전 필드별 항목은 더 이상 쓰이지 않으므로 정리
+                for f in cls.LEGACY_FIELDS:
+                    KeychainManager.delete_password(cls.SERVICE_NAME, f)
+
+        if not legacy:
+            return {}
+
+        logger.info("[App] 예전 방식의 설정을 '비밀번호는 Keychain / 나머지는 로컬 파일'로 분리 마이그레이션합니다.")
+        return cls.save_config(legacy)
 
     @classmethod
     def save_config(cls, updates):
-        """기존 설정과 병합하여 단일 JSON keychain 항목에 저장 (부분 갱신 지원)."""
-        raw = KeychainManager.get_password(cls.SERVICE_NAME, cls.CONFIG_ACCOUNT)
-        try:
-            config = json.loads(raw) if raw else {}
-        except (ValueError, TypeError):
-            config = {}
-        config.update(updates)
-        KeychainManager.save_password(cls.SERVICE_NAME, cls.CONFIG_ACCOUNT, json.dumps(config))
-        return config
+        """부분 갱신 지원: 비밀번호는 Keychain에, 나머지는 로컬 설정 파일에 나눠 저장."""
+        secret_updates = {k: v for k, v in updates.items() if k in cls.SECRET_FIELDS}
+        plain_updates = {k: v for k, v in updates.items() if k not in cls.SECRET_FIELDS}
+
+        if plain_updates:
+            local = cls._read_local_config()
+            local.update(plain_updates)
+            cls._write_local_config(local)
+
+        if secret_updates:
+            secret = cls._read_secret_config()
+            secret.update(secret_updates)
+            cls._write_secret_config(secret)
+
+        return cls.load_config()
 
     def __init__(self):
         # 🔴 상태로 최초 아이콘 로드 (메뉴바 상주용)
