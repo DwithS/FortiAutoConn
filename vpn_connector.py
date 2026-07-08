@@ -177,7 +177,9 @@ class VPNConnector:
                     # 1차 비밀번호 제출 후 다음/카카오 이메일로 발송된 최신 메일 OTP 조회
                     otp_code = self.mail_checker.fetch_latest_otp(max_wait_seconds=90)
                     if otp_code:
-                        logger.info(f"[VPNConnector] 메일에서 파싱된 OTP 적용 입력: {otp_code}")
+                        # 로그 파일이 평문으로 보관되므로 코드는 첫 자리만 남기고 마스킹
+                        masked = otp_code[:1] + "*" * (len(otp_code) - 1)
+                        logger.info(f"[VPNConnector] 메일에서 파싱된 OTP 적용 입력: {masked}")
                         self.process.sendline(otp_code)
                     else:
                         # 메일 로그인 거부가 원인이면 재시도해도 해결되지 않으므로 원인 코드를 전달

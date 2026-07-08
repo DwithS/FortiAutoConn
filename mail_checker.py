@@ -269,7 +269,9 @@ class MailChecker:
                     if len(_consumed_message_ids) > 200:
                         _consumed_message_ids.clear()
                     _consumed_message_ids.add(message_id)
-                logger.info(f"[MailChecker] OTP 메일 감지 성공! 추출된 OTP: {otp_code} (메일 시간: {mail_time})")
+                # 로그 파일이 평문으로 보관되므로 코드는 첫 자리만 남기고 마스킹
+                masked = otp_code[:1] + "*" * (len(otp_code) - 1)
+                logger.info(f"[MailChecker] OTP 메일 감지 성공! 추출된 OTP: {masked} (메일 시간: {mail_time})")
                 return otp_code
 
         return None
