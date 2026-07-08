@@ -48,6 +48,10 @@ class VPNConnector:
         self._mail_verified = False  # 메일 로그인 사전 점검 통과 여부 (자가 복구 재시도 시 중복 점검 방지)
 
     def set_status(self, new_status):
+        # 동일 상태 재통지 차단: 이미 DISCONNECTED로 통지된 커넥터를 정리 목적으로 stop()해도
+        # App의 자동 재연결이 이중 스케줄링되지 않도록 상태가 실제로 바뀔 때만 콜백을 부릅니다.
+        if new_status == self.status:
+            return
         self.status = new_status
         if self.on_status_change:
             self.on_status_change(new_status)
@@ -64,12 +68,20 @@ class VPNConnector:
         self.thread = threading.Thread(target=self._run_vpn, daemon=True)
         self.thread.start()
 
-    def stop(self):
-        """VPN 연결을 해제하고 프로세스를 정리합니다."""
+    def stop(self, notify=True):
+        """VPN 연결을 해제하고 프로세스를 정리합니다.
+
+        notify=False: 상태 통지 없이 조용히 정리만 수행합니다. 자동 재연결 직전에
+        기존(이미 FAILED/DISCONNECTED로 통지된) 커넥터를 교체·정리할 때 사용하며,
+        이때 DISCONNECTED를 다시 통지하면 App의 재연결 플로우가 또 스케줄링됩니다.
+        """
         logger.info("[VPNConnector] VPN 연결 종료 프로세스 작동...")
         self._stop_event.set()
         self._terminate_process()
-        self.set_status(self.STATUS_DISCONNECTED)
+        if notify:
+            self.set_status(self.STATUS_DISCONNECTED)
+        else:
+            self.status = self.STATUS_DISCONNECTED
 
     def _terminate_process(self):
         """openfortivpn 프로세스만 조용히 종료합니다 (상태 통지 없음)."""

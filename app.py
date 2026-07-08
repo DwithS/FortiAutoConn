@@ -674,6 +674,9 @@ class FortiAutoConnApp(rumps.App):
         self.auto_reconnect_enabled = False
         self.reconnect_timer = None
         self.settings_server = None
+        # Connect 클릭 ~ Touch ID 인증 사이에는 메뉴가 아직 활성 상태라 더블클릭 시
+        # 연결 절차가 2개 돌 수 있음 → 논블로킹 락으로 동시 진입을 차단
+        self._connect_lock = threading.Lock()
         
         # 2차 개선: 연속 재시도 횟수 제한 및 백오프 변수 초기화
         self.reconnect_attempts = 0
@@ -796,7 +799,12 @@ class FortiAutoConnApp(rumps.App):
             return
             
         logger.info(f"[App] 백그라운드 자동 재접속 기동 실행... (재시도 회차: {self.reconnect_attempts}/{self.max_reconnect_attempts})")
-        
+
+        # 기존 커넥터를 조용히(상태 재통지 없이) 정리 후 새 커넥터로 교체
+        # (잔존 sudo 래퍼 프로세스/감시 스레드가 새 연결과 겹치는 것을 방지)
+        if self.connector:
+            self.connector.stop(notify=False)
+
         c = self.cached_creds
         mail_checker = MailChecker(
             host=c["mail_host"],
@@ -821,54 +829,67 @@ class FortiAutoConnApp(rumps.App):
 
     def on_connect(self, sender):
         """Connect VPN 메뉴 버튼 클릭 이벤트 처리 (메인 스레드 대기 방지를 위해 백그라운드 스레드에서 비동기 처리)"""
+        # 이미 연결 중/연결됨이거나 연결 절차(Touch ID 대기 등)가 진행 중이면 중복 진입 차단
+        if self.connector and self.connector.status in (VPNConnector.STATUS_CONNECTING, VPNConnector.STATUS_CONNECTED):
+            logger.info("[App] 이미 연결 중이거나 연결된 상태라 Connect 요청을 무시합니다.")
+            return
+        if not self._connect_lock.acquire(blocking=False):
+            logger.info("[App] 연결 절차가 이미 진행 중이라(Touch ID 대기 등) Connect 요청을 무시합니다.")
+            return
+
         logger.info("[App] 사용자가 수동으로 Connect VPN을 호출했습니다.")
         # 수동 연결 시도 시 재연결 시도 카운터 0으로 초기화
         self.reconnect_attempts = 0
         threading.Thread(target=self._bg_connect, daemon=True).start()
 
     def _bg_connect(self):
-        # Touch ID 시스템 프롬프트가 포커스를 받을 수 있도록 앱 강제 활성화
-        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
-        
-        # 1. 지문인식(Touch ID) 또는 로컬 로그인 암호 확인 팝업 호출
-        if not KeychainManager.authenticate_touch_id("FortiVPN 보안 터널 형성을 위해 본인 생체정보를 인증해 주세요."):
-            logger.warning("[App] Touch ID 인증이 거부되었거나 취소되었습니다.")
-            self._safe_alert("보안 인증 오류", "맥북 본인인증(Touch ID)이 차단되거나 취소되어 저장된 키체인 자격증명을 불러올 수 없습니다.")
-            return
+        # on_connect에서 획득한 _connect_lock을 절차 종료 시점(성공이면 connector.start() 직후,
+        # 실패면 조기 리턴 시)에 반드시 해제합니다. 이후의 중복 클릭은 connector.status 검사가 막습니다.
+        try:
+            # Touch ID 시스템 프롬프트가 포커스를 받을 수 있도록 앱 강제 활성화
+            NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
 
-        # 2. 키체인 저장 정보 로드
-        creds = self._load_credentials_from_keychain()
-        if not creds:
-            logger.warning("[App] 키체인에 필요한 계정 정보(VPN / Mail)가 일부 누락되어 로드 실패.")
-            self._safe_alert("자격 증명 미설정", "설정된 VPN 혹은 메일 계정 정보가 없습니다. 메뉴에서 'Settings'를 선택하여 최초 1회 등록해 주세요.")
-            self.on_settings(None)
-            return
+            # 1. 지문인식(Touch ID) 또는 로컬 로그인 암호 확인 팝업 호출
+            if not KeychainManager.authenticate_touch_id("FortiVPN 보안 터널 형성을 위해 본인 생체정보를 인증해 주세요."):
+                logger.warning("[App] Touch ID 인증이 거부되었거나 취소되었습니다.")
+                self._safe_alert("보안 인증 오류", "맥북 본인인증(Touch ID)이 차단되거나 취소되어 저장된 키체인 자격증명을 불러올 수 없습니다.")
+                return
 
-        # 3. 자동 재연결에 사용할 세션을 안전하게 메모리 캐시에 등록
-        self.cached_creds = creds
-        self.auto_reconnect_enabled = True
-        
-        # 4. VPN 시작
-        mail_checker = MailChecker(
-            host=creds["mail_host"],
-            port=creds["mail_port"],
-            username=creds["mail_user"],
-            password=creds["mail_pass"],
-            mailbox=creds.get("mail_folder", "INBOX")
-        )
-        
-        self.connector = VPNConnector(
-            host=creds["vpn_host"],
-            port=creds["vpn_port"],
-            username=creds["vpn_user"],
-            password=creds["vpn_pass"],
-            mail_checker=mail_checker,
-            on_status_change=self.on_status_change,
-            dns_bypass=(creds.get("vpn_dns_bypass") == "true"),
-            split_tunnel=(creds.get("vpn_split_tunnel") == "true"),
-            split_routes=creds.get("vpn_split_routes", "")
-        )
-        self.connector.start()
+            # 2. 키체인 저장 정보 로드
+            creds = self._load_credentials_from_keychain()
+            if not creds:
+                logger.warning("[App] 키체인에 필요한 계정 정보(VPN / Mail)가 일부 누락되어 로드 실패.")
+                self._safe_alert("자격 증명 미설정", "설정된 VPN 혹은 메일 계정 정보가 없습니다. 메뉴에서 'Settings'를 선택하여 최초 1회 등록해 주세요.")
+                self.on_settings(None)
+                return
+
+            # 3. 자동 재연결에 사용할 세션을 안전하게 메모리 캐시에 등록
+            self.cached_creds = creds
+            self.auto_reconnect_enabled = True
+
+            # 4. VPN 시작
+            mail_checker = MailChecker(
+                host=creds["mail_host"],
+                port=creds["mail_port"],
+                username=creds["mail_user"],
+                password=creds["mail_pass"],
+                mailbox=creds.get("mail_folder", "INBOX")
+            )
+
+            self.connector = VPNConnector(
+                host=creds["vpn_host"],
+                port=creds["vpn_port"],
+                username=creds["vpn_user"],
+                password=creds["vpn_pass"],
+                mail_checker=mail_checker,
+                on_status_change=self.on_status_change,
+                dns_bypass=(creds.get("vpn_dns_bypass") == "true"),
+                split_tunnel=(creds.get("vpn_split_tunnel") == "true"),
+                split_routes=creds.get("vpn_split_routes", "")
+            )
+            self.connector.start()
+        finally:
+            self._connect_lock.release()
 
     def _safe_alert(self, title, message):
         """서브 스레드에서 호출 시 메인 UI를 블로킹하지 않도록 안전하게 대화상자 호출"""
