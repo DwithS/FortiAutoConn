@@ -114,15 +114,19 @@ class VPNConnector:
                 return
             self._mail_verified = True
 
-        # 이미 자동 감지된 인증서 해시가 있다면 실행 인자에 포함하여 검증 에러 우회
-        trusted_cert_flag = f" --trusted-cert {self.trusted_cert}" if self.trusted_cert else ""
-        dns_bypass_flag = " --pppd-no-peerdns --no-dns" if self.dns_bypass else ""
-        split_tunnel_flag = " --no-routes" if self.split_tunnel else ""
-
         # sudo -n: sudoers(NOPASSWD) 미설정 시 조용히 비밀번호 입력을 기다리다
         # 'Password:' 프롬프트에 VPN 비밀번호가 잘못 입력되는 사고를 막고 즉시 실패시킵니다.
-        cmd = f"sudo -n openfortivpn {self.host}:{self.port} -u {self.username}{trusted_cert_flag}{dns_bypass_flag}{split_tunnel_flag}"
-        logger.info(f"[VPNConnector] openfortivpn 실행 명령: {cmd}")
+        # 💡 argv 배열로 전달: 설정 UI에서 온 host/username 값에 공백 등이 섞여 있어도
+        # 문자열 분해 과정에서 임의의 openfortivpn 인자로 해석되는 것(인자 주입)을 차단합니다.
+        args = ["-n", "openfortivpn", f"{self.host}:{self.port}", "-u", str(self.username)]
+        if self.trusted_cert:
+            # 이미 자동 감지된 인증서 해시가 있다면 실행 인자에 포함하여 검증 에러 우회
+            args += ["--trusted-cert", self.trusted_cert]
+        if self.dns_bypass:
+            args += ["--pppd-no-peerdns", "--no-dns"]
+        if self.split_tunnel:
+            args.append("--no-routes")
+        logger.info(f"[VPNConnector] openfortivpn 실행 명령: sudo {' '.join(args)}")
 
         # 반복 제출 방지 카운터: 거부된 비밀번호/OTP를 계속 다시 보내면
         # 인증 메일이 남발되고 VPN 계정이 잠기므로 횟수를 엄격히 제한합니다.
@@ -132,7 +136,7 @@ class VPNConnector:
         try:
             # pexpect를 사용한 터미널 프롬프트 실시간 제어
             # 인코딩 utf-8 설정 필수
-            self.process = pexpect.spawn(cmd, encoding='utf-8', timeout=120)
+            self.process = pexpect.spawn("sudo", args, encoding='utf-8', timeout=120)
 
             # 감시할 패턴 정의
             # 0: 비밀번호 요구 프롬프트
@@ -325,11 +329,11 @@ class VPNConnector:
                 has_error = True
                 continue
 
-            route_cmd = f"sudo -n route add -net {route} -interface {ppp_if}"
-            logger.info(f"[VPNConnector] 라우팅 테이블 등록 시도: {route_cmd}")
-            ret = subprocess.call(route_cmd, shell=True)
+            route_cmd = ["sudo", "-n", "route", "add", "-net", route, "-interface", ppp_if]
+            logger.info(f"[VPNConnector] 라우팅 테이블 등록 시도: {' '.join(route_cmd)}")
+            ret = subprocess.call(route_cmd)
             if ret != 0:
-                logger.warning(f"[VPNConnector] ⚠️ 라우팅 등록 실패(반환 코드 {ret}): {route_cmd}")
+                logger.warning(f"[VPNConnector] ⚠️ 라우팅 등록 실패(반환 코드 {ret}): {' '.join(route_cmd)}")
                 has_error = True
 
         if has_error:
