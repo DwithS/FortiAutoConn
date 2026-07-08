@@ -824,27 +824,30 @@ class FortiAutoConnApp(rumps.App):
         if self.connector:
             self.connector.stop(notify=False)
 
-        c = self.cached_creds
+        self.connector = self._build_connector(self.cached_creds)
+        self.connector.start()
+
+    def _build_connector(self, creds):
+        """자격 증명 딕셔너리로 MailChecker + VPNConnector를 조립합니다.
+        (수동 연결과 자동 재연결이 동일한 구성 경로를 타도록 단일화)"""
         mail_checker = MailChecker(
-            host=c["mail_host"],
-            port=c["mail_port"],
-            username=c["mail_user"],
-            password=c["mail_pass"],
-            mailbox=c.get("mail_folder", "INBOX")
+            host=creds["mail_host"],
+            port=creds["mail_port"],
+            username=creds["mail_user"],
+            password=creds["mail_pass"],
+            mailbox=creds.get("mail_folder", "INBOX")
         )
-        
-        self.connector = VPNConnector(
-            host=c["vpn_host"],
-            port=c["vpn_port"],
-            username=c["vpn_user"],
-            password=c["vpn_pass"],
+        return VPNConnector(
+            host=creds["vpn_host"],
+            port=creds["vpn_port"],
+            username=creds["vpn_user"],
+            password=creds["vpn_pass"],
             mail_checker=mail_checker,
             on_status_change=self.on_status_change,
-            dns_bypass=(c.get("vpn_dns_bypass") == "true"),
-            split_tunnel=(c.get("vpn_split_tunnel") == "true"),
-            split_routes=c.get("vpn_split_routes", "")
+            dns_bypass=(creds.get("vpn_dns_bypass") == "true"),
+            split_tunnel=(creds.get("vpn_split_tunnel") == "true"),
+            split_routes=creds.get("vpn_split_routes", "")
         )
-        self.connector.start()
 
     def on_connect(self, sender):
         """Connect VPN 메뉴 버튼 클릭 이벤트 처리 (메인 스레드 대기 방지를 위해 백그라운드 스레드에서 비동기 처리)"""
@@ -887,25 +890,7 @@ class FortiAutoConnApp(rumps.App):
             self.auto_reconnect_enabled = True
 
             # 4. VPN 시작
-            mail_checker = MailChecker(
-                host=creds["mail_host"],
-                port=creds["mail_port"],
-                username=creds["mail_user"],
-                password=creds["mail_pass"],
-                mailbox=creds.get("mail_folder", "INBOX")
-            )
-
-            self.connector = VPNConnector(
-                host=creds["vpn_host"],
-                port=creds["vpn_port"],
-                username=creds["vpn_user"],
-                password=creds["vpn_pass"],
-                mail_checker=mail_checker,
-                on_status_change=self.on_status_change,
-                dns_bypass=(creds.get("vpn_dns_bypass") == "true"),
-                split_tunnel=(creds.get("vpn_split_tunnel") == "true"),
-                split_routes=creds.get("vpn_split_routes", "")
-            )
+            self.connector = self._build_connector(creds)
             self.connector.start()
         finally:
             self._connect_lock.release()
