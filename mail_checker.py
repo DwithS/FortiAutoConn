@@ -16,7 +16,8 @@ def encode_imap_utf7(s):
         return s
 
     # 영문/숫자/기본 특수문자만 있다면 변환 생략
-    if all(32 <= ord(c) <= 126 for c in s):
+    # (단, '&'는 RFC 3501 Modified UTF-7에서 '&-'로 이스케이프해야 하므로 조기 반환 불가)
+    if "&" not in s and all(32 <= ord(c) <= 126 for c in s):
         return s
 
     r = []
@@ -86,6 +87,11 @@ def direct_imap_select(mail, mailbox_name):
 # 이미 OTP 입력에 사용한 메일의 Message-ID 기록.
 # 재연결 시 이전 시도에서 쓴(이미 만료된) 과거 OTP를 다시 집어 실패 루프를 도는 것을 방지합니다.
 _consumed_message_ids = set()
+
+# OTP 추출 정규식 (제목 또는 본문):
+# 1) 제목: AuthCode: 123456
+# 2) 본문: Your authentication token code is 123456.
+OTP_CODE_PATTERN = re.compile(r"(?:AuthCode:\s*|Your authentication token code is\s*)(\d{6})", re.IGNORECASE)
 
 class MailChecker:
     # 계정 접근제한(과다 로그인 차단) 방지: 한 번의 OTP 감시 동안 허용되는 최대 IMAP 로그인 횟수
@@ -294,10 +300,7 @@ class MailChecker:
         start_time = datetime.datetime.now(datetime.timezone.utc)
         elapsed = 0
 
-        # 메일 제목 또는 본문 정규식 패턴
-        # 1) 제목: AuthCode: 123456
-        # 2) 본문: Your authentication token code is 123456.
-        code_pattern = re.compile(r"(?:AuthCode:\s*|Your authentication token code is\s*)(\d{6})", re.IGNORECASE)
+        code_pattern = OTP_CODE_PATTERN
 
         mail = None
         select_param = None
