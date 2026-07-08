@@ -9,6 +9,7 @@ import threading
 import webbrowser
 import signal
 from AppKit import NSApplication
+from PyObjCTools import AppHelper
 from keychain_manager import KeychainManager
 from mail_checker import MailChecker
 from vpn_connector import VPNConnector
@@ -779,11 +780,20 @@ class FortiAutoConnApp(rumps.App):
             )
 
     def on_status_change(self, new_status):
-        """VPNConnector의 비동기 백그라운드 스레드에서 온 상태 변경 콜백을 메인 UI 스레드로 릴레이"""
-        threading.Thread(target=self._safe_update_ui, args=(new_status,), daemon=True).start()
+        """VPNConnector의 비동기 백그라운드 스레드에서 온 상태 변경 콜백을 메인 UI 스레드로 릴레이.
 
-    def _safe_update_ui(self, status):
-        self.update_ui(status)
+        update_ui가 건드리는 메뉴바 title(NSStatusBar)과 메뉴 콜백은 AppKit 객체라
+        반드시 메인 스레드에서 다뤄야 합니다. AppHelper.callAfter는 호출을 Cocoa
+        메인 이벤트 루프에 예약하는 PyObjC의 공식 릴레이 수단입니다.
+        (예전 구현은 '릴레이'라며 또 다른 백그라운드 스레드를 만들어 실행했음 → 잠재 크래시)
+        """
+        AppHelper.callAfter(self.update_ui, new_status)
+
+    @staticmethod
+    def _activate_app():
+        """앱을 전면 활성화합니다 (AppKit 호출이므로 메인 스레드에서만 직접 호출,
+        백그라운드 스레드에서는 AppHelper.callAfter(self._activate_app)로 릴레이)."""
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
 
     def trigger_auto_reconnect(self, delay=10.0):
         """지정된 지연 시간(초) 이후 백라운드 재접속 스케줄링"""
@@ -846,8 +856,8 @@ class FortiAutoConnApp(rumps.App):
         # on_connect에서 획득한 _connect_lock을 절차 종료 시점(성공이면 connector.start() 직후,
         # 실패면 조기 리턴 시)에 반드시 해제합니다. 이후의 중복 클릭은 connector.status 검사가 막습니다.
         try:
-            # Touch ID 시스템 프롬프트가 포커스를 받을 수 있도록 앱 강제 활성화
-            NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+            # Touch ID 시스템 프롬프트가 포커스를 받을 수 있도록 앱 강제 활성화 (메인 스레드로 릴레이)
+            AppHelper.callAfter(self._activate_app)
 
             # 1. 지문인식(Touch ID) 또는 로컬 로그인 암호 확인 팝업 호출
             if not KeychainManager.authenticate_touch_id("FortiVPN 보안 터널 형성을 위해 본인 생체정보를 인증해 주세요."):
@@ -892,8 +902,8 @@ class FortiAutoConnApp(rumps.App):
             self._connect_lock.release()
 
     def _safe_alert(self, title, message):
-        """서브 스레드에서 호출 시 메인 UI를 블로킹하지 않도록 안전하게 대화상자 호출"""
-        threading.Thread(target=lambda: rumps.alert(title, message), daemon=True).start()
+        """서브 스레드에서 호출해도 안전하도록 rumps.alert(AppKit 모달)를 메인 스레드로 릴레이"""
+        AppHelper.callAfter(rumps.alert, title, message)
 
     def on_disconnect(self, sender):
         """Disconnect VPN 메뉴 버튼 클릭 이벤트 처리 (수동 해제)"""
@@ -920,8 +930,8 @@ class FortiAutoConnApp(rumps.App):
             return
 
         def on_save_success():
-            # 저장 성공 시 알림 후 서버 해제
-            NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+            # 저장 성공 시 알림 후 서버 해제 (백그라운드 스레드이므로 AppKit 호출은 메인으로 릴레이)
+            AppHelper.callAfter(self._activate_app)
             self.show_notification("FortiAutoConn", "설정 갱신 완료", "새로운 설정이 시스템 Keychain에 성공적으로 업데이트되었습니다.")
             logger.info("[App] 로컬 설정 웹 페이지 저장 성공 콜백 수신. 웹 서버 소멸 대기...")
             
