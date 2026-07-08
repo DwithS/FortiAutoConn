@@ -5,6 +5,7 @@ import time
 import json
 import html
 import secrets
+import subprocess
 import threading
 import webbrowser
 import signal
@@ -685,16 +686,24 @@ class FortiAutoConnApp(rumps.App):
         logger.info("[App] FortiAutoConnApp 인스턴스 초기화 완료.")
 
     def show_notification(self, title, subtitle, message):
-        """macOS 내장 AppleScript를 활용하여 런타임 에러 없이 100% 안전하게 알림을 송출합니다."""
+        """macOS 내장 AppleScript로 알림을 송출합니다.
+
+        셸을 거치지 않고 osascript를 argv 배열로 직접 실행해 인용부호 깨짐/주입 문제를
+        원천 차단합니다. AppleScript 문자열 리터럴의 이스케이프 규칙(\\", \\\\)은
+        json.dumps(ensure_ascii=False)와 정확히 일치합니다.
+        Popen(fire-and-forget)이라 메인 스레드에서 불러도 블로킹되지 않습니다.
+        """
         try:
-            # 특수 문자 에스케이프 처리
-            safe_title = title.replace('"', '\\"')
-            safe_subtitle = subtitle.replace('"', '\\"')
-            safe_message = message.replace('"', '\\"')
-            
-            # osascript 명령 구성
-            cmd = f'osascript -e \'display notification "{safe_message}" with title "{safe_title}" subtitle "{safe_subtitle}"\''
-            os.system(cmd)
+            script = (
+                f"display notification {json.dumps(message, ensure_ascii=False)} "
+                f"with title {json.dumps(title, ensure_ascii=False)} "
+                f"subtitle {json.dumps(subtitle, ensure_ascii=False)}"
+            )
+            subprocess.Popen(
+                ["osascript", "-e", script],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
         except Exception as e:
             logger.error(f"[Notification Error] 알림 송출 실패: {e}")
 
