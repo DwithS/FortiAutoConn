@@ -108,7 +108,6 @@ class SettingsHTTPServer:
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>FortiAutoConn 환경 설정</title>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&family=Noto+Sans+KR:wght@300;400;700&display=swap" rel="stylesheet">
     <style>
         :root {{
             --bg-color: #0f0f1a;
@@ -124,7 +123,7 @@ class SettingsHTTPServer:
             box-sizing: border-box;
             margin: 0;
             padding: 0;
-            font-family: 'Outfit', 'Noto Sans KR', sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, 'Apple SD Gothic Neo', 'Noto Sans KR', sans-serif;
         }}
         body {{
             background: radial-gradient(circle at 50% 50%, #1e1e2f 0%, var(--bg-color) 100%);
@@ -540,12 +539,11 @@ h1{{color:#f38ba8;margin-bottom:15px;font-size:1.3rem;}} ul{{line-height:1.8;pad
 <head>
     <meta charset="UTF-8">
     <title>설정 완료</title>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;700&family=Noto+Sans+KR:wght@400;700&display=swap" rel="stylesheet">
     <style>
         body {
             background: #0f0f1a;
             color: #cdd6f4;
-            font-family: 'Outfit', 'Noto Sans KR', sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, 'Apple SD Gothic Neo', 'Noto Sans KR', sans-serif;
             height: 100vh;
             display: flex;
             align-items: center;
