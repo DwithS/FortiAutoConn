@@ -93,6 +93,7 @@ class SettingsHTTPServer:
                 mail_port = esc(config.get("mail_port") or "993")
                 mail_user = esc(config.get("mail_user"))
                 mail_folder = esc(config.get("mail_folder") or "INBOX")
+                otp_sender = esc(config.get("otp_sender") or MailChecker.DEFAULT_OTP_SENDER)
 
                 dns_checked = "checked" if vpn_dns_bypass == "true" else ""
                 split_checked = "checked" if vpn_split_tunnel == "true" else ""
@@ -416,6 +417,10 @@ class SettingsHTTPServer:
                     <label for="mail_pass">Mail Password</label>
                     <input type="password" id="mail_pass" name="mail_pass" placeholder="기존 비밀번호 유지 시 빈 칸">
                 </div>
+                <div class="form-group">
+                    <label for="otp_sender">인증 메일 발신자</label>
+                    <input type="text" id="otp_sender" name="otp_sender" placeholder="인증 코드 메일의 발신 주소" value="{otp_sender}" required>
+                </div>
             </div>
 
             <button type="submit" class="btn-submit">설정 정보 저장 및 등록</button>
@@ -480,6 +485,7 @@ class SettingsHTTPServer:
                         "mail_port": data.get("mail_port", ""),
                         "mail_user": data.get("mail_user", ""),
                         "mail_folder": data.get("mail_folder", "INBOX"),
+                        "otp_sender": data.get("otp_sender", ""),
                     }
                     if data.get("vpn_pass", ""):
                         updates["vpn_pass"] = data["vpn_pass"]
@@ -835,7 +841,8 @@ class FortiAutoConnApp(rumps.App):
             port=creds["mail_port"],
             username=creds["mail_user"],
             password=creds["mail_pass"],
-            mailbox=creds.get("mail_folder", "INBOX")
+            mailbox=creds.get("mail_folder", "INBOX"),
+            otp_sender=creds.get("otp_sender")
         )
         return VPNConnector(
             host=creds["vpn_host"],
@@ -977,6 +984,7 @@ class FortiAutoConnApp(rumps.App):
         mail_user = config.get("mail_user")
         mail_folder = config.get("mail_folder") or "INBOX"
         mail_pass = config.get("mail_pass")
+        otp_sender = config.get("otp_sender") or ""  # 비어 있으면 MailChecker 기본값 사용
 
         if not all([vpn_host, vpn_port, vpn_user, vpn_pass, mail_host, mail_port, mail_user, mail_pass]):
             return None
@@ -993,7 +1001,8 @@ class FortiAutoConnApp(rumps.App):
             "mail_port": mail_port,
             "mail_user": mail_user,
             "mail_folder": mail_folder,
-            "mail_pass": mail_pass
+            "mail_pass": mail_pass,
+            "otp_sender": otp_sender
         }
 
     def terminate(self):

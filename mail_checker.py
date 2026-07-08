@@ -91,11 +91,15 @@ class MailChecker:
     # 계정 접근제한(과다 로그인 차단) 방지: 한 번의 OTP 감시 동안 허용되는 최대 IMAP 로그인 횟수
     MAX_LOGIN_ATTEMPTS = 3
 
-    def __init__(self, host, port, username, password, mailbox="INBOX"):
+    # 인증(OTP) 메일 발신자 기본값. Settings에서 otp_sender로 변경 가능합니다.
+    DEFAULT_OTP_SENDER = "it@daily-funding.com"
+
+    def __init__(self, host, port, username, password, mailbox="INBOX", otp_sender=None):
         self.host = host
         self.port = int(port)
         self.username = username
         self.password = password
+        self.otp_sender = (otp_sender or self.DEFAULT_OTP_SENDER).strip()
 
         # 서버가 로그인을 명시적으로 '거부'(비밀번호 오류 등)했는지 여부.
         # True이면 상위(VPNConnector/App)에서 자동 재연결을 중단해 계정 잠금을 방지합니다.
@@ -173,13 +177,13 @@ class MailChecker:
                     folder_name_str = folder_bytes.decode('utf-8', errors='ignore')
                     target_clean = self.mailbox.strip('"').strip("'").strip()
 
-                    # 공통 핵심 키워드 매칭
-                    target_keyword = "df vpn"
-                    clean_target_lower = target_clean.lower().replace(" ", "")
+                    # 핵심 키워드 매칭: 설정된 폴더명(UTF-7 인코딩 형태)의 ASCII 접두부를
+                    # 키워드로 삼아, 서버가 비ASCII 부분을 다른 표기로 반환해도 매칭되게 합니다.
+                    # (예: 'DF VPN &x3jJnQ-' → 접두부 'dfvpn')
+                    ascii_prefix = target_clean.split("&", 1)[0].lower().replace(" ", "")
                     clean_folder_lower = folder_name_str.lower().replace(" ", "")
-                    key_no_space = target_keyword.replace(" ", "")
 
-                    if (key_no_space in clean_folder_lower) and (key_no_space in clean_target_lower):
+                    if len(ascii_prefix) >= 3 and ascii_prefix in clean_folder_lower:
                         is_match = True
                     else:
                         is_match = (target_clean.lower() in folder_name_str.lower()) or \
@@ -270,9 +274,10 @@ class MailChecker:
 
         return None
 
-    def fetch_latest_otp(self, sender_filter="it@daily-funding.com", max_wait_seconds=90):
+    def fetch_latest_otp(self, sender_filter=None, max_wait_seconds=90):
         """
         메일함에서 최신 OTP 번호를 감시하여 반환합니다.
+        sender_filter를 생략하면 설정된 otp_sender(기본 DEFAULT_OTP_SENDER)를 사용합니다.
 
         계정 접근제한(과다 로그인 차단) 방지 설계:
         - IMAP 로그인은 1회만 수행하고 같은 연결을 재사용하며 3초마다 재검색만 합니다.
@@ -280,6 +285,7 @@ class MailChecker:
         - 서버가 로그인을 거부하면(비밀번호 오류) 즉시 중단하고 auth_failed=True를 세웁니다.
         - 네트워크 장애로 인한 재접속도 최대 MAX_LOGIN_ATTEMPTS회로 제한합니다.
         """
+        sender_filter = sender_filter or self.otp_sender
         logger.info(f"[MailChecker] {sender_filter} 로부터의 OTP 메일 감시 시작 (최대 {max_wait_seconds}초 대기)...")
 
         self.auth_failed = False
