@@ -28,7 +28,10 @@ class SettingsHTTPServer:
         # 서버 기동 시 발급한 토큰을 URL 쿼리와 폼 hidden 필드로 주고받아 검증합니다.
         self.token = secrets.token_urlsafe(32)
 
-    def start(self):
+    def bind(self):
+        """핸들러 정의 + 루프백 포트 바인딩까지만 수행합니다.
+        포트 점유 등으로 실패하면 OSError를 그대로 전파하므로, 호출 측(on_settings)이
+        스레드 시작 전에 실패를 감지하고 사용자에게 알릴 수 있습니다."""
         from http.server import BaseHTTPRequestHandler, HTTPServer
         import urllib.parse
 
@@ -439,7 +442,14 @@ class SettingsHTTPServer:
                     self._deny(403, "Forbidden")
                     return
                 if self.path == "/save":
-                    content_length = int(self.headers['Content-Length'])
+                    # Content-Length 누락/비정상 값으로 핸들러가 예외로 죽지 않도록 방어
+                    try:
+                        content_length = int(self.headers.get('Content-Length') or 0)
+                    except ValueError:
+                        content_length = 0
+                    if content_length <= 0 or content_length > 1_000_000:
+                        self._deny(400, "Bad Request")
+                        return
                     post_data = self.rfile.read(content_length).decode('utf-8')
                     params = urllib.parse.parse_qs(post_data)
 
@@ -529,6 +539,9 @@ class SettingsHTTPServer:
         self.server = HTTPServer(('127.0.0.1', self.port), SettingsHandler)
         self.server.on_save_callback = self.on_save_callback
         self.server.access_token = self.token
+
+    def serve(self):
+        """(백그라운드 스레드에서 호출) 요청 처리 루프를 시작합니다. bind() 선행 필수."""
         self.server.serve_forever()
 
     def stop(self):
@@ -899,9 +912,22 @@ class FortiAutoConnApp(rumps.App):
                 logger.info("[App] 설정용 로컬 웹 서버가 안전하게 중지 및 파기되었습니다.")
 
         # 로컬 루프백 전용 웹 서버 구동
-        self.settings_server = SettingsHTTPServer(18372, self.SERVICE_NAME, on_save_success)
-        
-        server_thread = threading.Thread(target=self.settings_server.start, daemon=True)
+        # 바인딩은 스레드 시작 전에 수행: 포트 점유 등으로 실패하면 여기서 바로 감지해 알립니다.
+        # (기존에는 데몬 스레드 안에서 조용히 죽어, 이후 Settings 클릭이 죽은 페이지만 열었음)
+        server = SettingsHTTPServer(18372, self.SERVICE_NAME, on_save_success)
+        try:
+            server.bind()
+        except OSError as e:
+            logger.error(f"[App] 설정용 로컬 웹 서버 바인딩 실패 (Port: 18372): {e}")
+            self.show_notification(
+                "FortiAutoConn",
+                "설정 창 열기 실패",
+                "127.0.0.1:18372 포트를 사용할 수 없습니다. 해당 포트를 점유한 프로그램을 종료한 뒤 다시 시도해 주세요."
+            )
+            return
+
+        self.settings_server = server
+        server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
         logger.info("[App] 설정용 로컬 웹 서버 시작 완료 (Port: 18372). 브라우저를 호출합니다.")
 
