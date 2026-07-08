@@ -6,6 +6,7 @@ import json
 import html
 import secrets
 import subprocess
+import ipaddress
 import threading
 import webbrowser
 import signal
@@ -470,6 +471,42 @@ class SettingsHTTPServer:
 
                     # 고급 옵션 계산 (체크박스는 선택 해제 시 post 데이터에 없으므로 기본값 처리)
                     split_val = "true" if data.get("vpn_split_tunnel", "false") == "true" else "false"
+
+                    # 서버측 입력 검증: 잘못된 포트/IP 대역이 저장되면 연결 시점에
+                    # 백그라운드 스레드에서 조용히 죽어 원인 파악이 어려우므로 저장 전에 걸러냅니다.
+                    errors = []
+
+                    def _valid_port(v):
+                        return v.isdigit() and 1 <= int(v) <= 65535
+
+                    if not _valid_port(data.get("vpn_port", "")):
+                        errors.append("VPN Port는 1~65535 사이의 숫자여야 합니다.")
+                    if not _valid_port(data.get("mail_port", "")):
+                        errors.append("IMAP Port는 1~65535 사이의 숫자여야 합니다.")
+                    if split_val == "true":
+                        for r in data.get("vpn_split_routes", "").split(","):
+                            r = r.strip()
+                            if not r:
+                                continue
+                            try:
+                                ipaddress.ip_network(r, strict=False)
+                            except ValueError:
+                                errors.append(f"잘못된 사내망 IP 대역 형식입니다: {r} (올바른 예: 10.0.0.0/8)")
+
+                    if errors:
+                        self.send_response(400)
+                        self.send_header("Content-type", "text/html; charset=utf-8")
+                        self.end_headers()
+                        error_items = "".join(f"<li>{html.escape(e)}</li>" for e in errors)
+                        error_html = f"""<!DOCTYPE html>
+<html lang="ko"><head><meta charset="UTF-8"><title>입력 오류</title>
+<style>body{{background:#0f0f1a;color:#cdd6f4;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;}}
+.card{{background:rgba(30,30,46,.8);border:1px solid rgba(255,255,255,.08);border-radius:20px;padding:40px;max-width:460px;}}
+h1{{color:#f38ba8;margin-bottom:15px;font-size:1.3rem;}} ul{{line-height:1.8;padding-left:20px;}} a{{color:#89b4fa;}}</style></head>
+<body><div class="card"><h1>⚠ 저장할 수 없습니다</h1><ul>{error_items}</ul>
+<p><a href="javascript:history.back()">← 돌아가서 수정하기</a></p></div></body></html>"""
+                        self.wfile.write(error_html.encode("utf-8"))
+                        return
                     # 스플릿 터널링 활성 시 DNS 우회 필수 동반 (회사 DNS 도달 불가로 인터넷 전체가 끊기는 것 방지)
                     dns_val = "true" if (data.get("vpn_dns_bypass", "false") == "true" or split_val == "true") else "false"
 
