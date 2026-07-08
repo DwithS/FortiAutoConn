@@ -3,6 +3,8 @@ import os
 import sys
 import time
 import json
+import html
+import secrets
 import threading
 import webbrowser
 import signal
@@ -21,6 +23,10 @@ class SettingsHTTPServer:
         self.service_name = service_name
         self.on_save_callback = on_save_callback
         self.server = None
+        # 🛡️ CSRF 방어용 1회성 접근 토큰: 루프백 바인딩만으로는 사용자의 브라우저에서 열린
+        # 악성 웹페이지가 127.0.0.1로 폼 POST를 쏘는 것(CSRF)을 막을 수 없습니다.
+        # 서버 기동 시 발급한 토큰을 URL 쿼리와 폼 hidden 필드로 주고받아 검증합니다.
+        self.token = secrets.token_urlsafe(32)
 
     def start(self):
         from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -32,35 +38,64 @@ class SettingsHTTPServer:
                 # 불필요한 HTTP 로그로 터미널이 어지러워지는 것을 방지하여 깔끔한 로그 유지
                 pass
 
+            def _host_allowed(self):
+                # DNS 리바인딩 방어: 브라우저가 보낸 Host 헤더가 우리가 연 루프백 주소일 때만 응답
+                host = self.headers.get("Host", "")
+                port = self.server.server_port
+                return host in (f"127.0.0.1:{port}", f"localhost:{port}")
+
+            def _token_valid(self, supplied):
+                return bool(supplied) and secrets.compare_digest(supplied, self.server.access_token)
+
+            def _deny(self, code, message):
+                self.send_response(code)
+                self.send_header("Content-type", "text/plain; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(message.encode("utf-8"))
+
             def do_GET(self):
-                if self.path == "/":
-                    self.send_response(200)
-                    self.send_header("Content-type", "text/html; charset=utf-8")
-                    self.end_headers()
-                    
-                    # 키체인의 단일 통합 설정 항목에서 최신 값 로드 (보안 강화)
-                    config = FortiAutoConnApp.load_config()
-                    vpn_host = config.get("vpn_host") or ""
-                    vpn_port = config.get("vpn_port") or "443"
-                    vpn_user = config.get("vpn_user") or ""
+                parsed = urllib.parse.urlparse(self.path)
+                if not self._host_allowed():
+                    self._deny(403, "Forbidden")
+                    return
+                if parsed.path != "/":
+                    self._deny(404, "Not Found")
+                    return
+                token = (urllib.parse.parse_qs(parsed.query).get("token") or [""])[0]
+                if not self._token_valid(token):
+                    self._deny(403, "Forbidden: 설정 페이지는 메뉴바 앱의 Settings 메뉴를 통해서만 열 수 있습니다.")
+                    return
 
-                    # 고급 옵션 로드 (스플릿 터널링 + DNS 우회 기본 활성화:
-                    # 전체 터널링은 Claude/Codex 등 외부 서비스 접속 불가 증상을 유발하므로 기본값을 켜짐으로 유지)
-                    vpn_dns_bypass = config.get("vpn_dns_bypass") or "true"
-                    vpn_split_tunnel = config.get("vpn_split_tunnel") or "true"
-                    vpn_split_routes = config.get("vpn_split_routes") or "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16"
+                self.send_response(200)
+                self.send_header("Content-type", "text/html; charset=utf-8")
+                self.end_headers()
 
-                    mail_host = config.get("mail_host") or "imap.daum.net"
-                    mail_port = config.get("mail_port") or "993"
-                    mail_user = config.get("mail_user") or ""
-                    mail_folder = config.get("mail_folder") or "INBOX"
+                # 키체인의 단일 통합 설정 항목에서 최신 값 로드 (보안 강화)
+                # 저장된 값이 HTML 속성 안에 삽입되므로 반드시 이스케이프하여 XSS를 차단합니다.
+                config = FortiAutoConnApp.load_config()
+                esc = lambda v: html.escape(v or "", quote=True)
+                vpn_host = esc(config.get("vpn_host"))
+                vpn_port = esc(config.get("vpn_port") or "443")
+                vpn_user = esc(config.get("vpn_user"))
 
-                    dns_checked = "checked" if vpn_dns_bypass == "true" else ""
-                    split_checked = "checked" if vpn_split_tunnel == "true" else ""
-                    split_display = "block" if vpn_split_tunnel == "true" else "none"
+                # 고급 옵션 로드 (스플릿 터널링 + DNS 우회 기본 활성화:
+                # 전체 터널링은 Claude/Codex 등 외부 서비스 접속 불가 증상을 유발하므로 기본값을 켜짐으로 유지)
+                vpn_dns_bypass = config.get("vpn_dns_bypass") or "true"
+                vpn_split_tunnel = config.get("vpn_split_tunnel") or "true"
+                vpn_split_routes = esc(config.get("vpn_split_routes") or "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16")
 
-                    # 프리미엄 다크 글래스모피즘 테마의 반응형 HTML/CSS UI
-                    html = f"""<!DOCTYPE html>
+                mail_host = esc(config.get("mail_host") or "imap.daum.net")
+                mail_port = esc(config.get("mail_port") or "993")
+                mail_user = esc(config.get("mail_user"))
+                mail_folder = esc(config.get("mail_folder") or "INBOX")
+
+                dns_checked = "checked" if vpn_dns_bypass == "true" else ""
+                split_checked = "checked" if vpn_split_tunnel == "true" else ""
+                split_display = "block" if vpn_split_tunnel == "true" else "none"
+                form_token = esc(token)
+
+                # 프리미엄 다크 글래스모피즘 테마의 반응형 HTML/CSS UI
+                page_html = f"""<!DOCTYPE html>
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
@@ -298,6 +333,7 @@ class SettingsHTTPServer:
             <div class="subtitle">보안 게이트웨이 및 인증 메일 계정 설정</div>
         </div>
         <form action="/save" method="POST">
+            <input type="hidden" name="token" value="{form_token}">
             <div class="section-title">🔒 VPN Gateway 설정</div>
             <div class="form-row">
                 <div class="form-group" style="flex: 2;">
@@ -396,9 +432,12 @@ class SettingsHTTPServer:
 </body>
 </html>
 """
-                    self.wfile.write(html.encode("utf-8"))
+                self.wfile.write(page_html.encode("utf-8"))
 
             def do_POST(self):
+                if not self._host_allowed():
+                    self._deny(403, "Forbidden")
+                    return
                 if self.path == "/save":
                     content_length = int(self.headers['Content-Length'])
                     post_data = self.rfile.read(content_length).decode('utf-8')
@@ -406,6 +445,11 @@ class SettingsHTTPServer:
 
                     # 파라미터 값 추출
                     data = {k: v[0].strip() for k, v in params.items()}
+
+                    # CSRF 방어: 폼에 실려 온 토큰이 서버 발급 토큰과 일치할 때만 저장 허용
+                    if not self._token_valid(data.get("token", "")):
+                        self._deny(403, "Forbidden: 잘못된 접근입니다. 메뉴바 앱의 Settings 메뉴로 다시 열어 주세요.")
+                        return
 
                     # 고급 옵션 계산 (체크박스는 선택 해제 시 post 데이터에 없으므로 기본값 처리)
                     split_val = "true" if data.get("vpn_split_tunnel", "false") == "true" else "false"
@@ -478,10 +522,13 @@ class SettingsHTTPServer:
                     # 서버 종료 및 후속 조치를 위해 콜백 실행
                     if self.server.on_save_callback:
                         threading.Thread(target=self.server.on_save_callback).start()
+                else:
+                    self._deny(404, "Not Found")
 
         # 대기 시간 없는 바인딩
         self.server = HTTPServer(('127.0.0.1', self.port), SettingsHandler)
         self.server.on_save_callback = self.on_save_callback
+        self.server.access_token = self.token
         self.server.serve_forever()
 
     def stop(self):
@@ -835,7 +882,7 @@ class FortiAutoConnApp(rumps.App):
         logger.info("[App] 사용자가 Settings 설정창 진입을 요청했습니다.")
         if self.settings_server:
             # 이미 서버가 돌고 있으면 브라우저 창만 한 번 더 띄워줍니다.
-            webbrowser.open("http://127.0.0.1:18372/")
+            webbrowser.open(f"http://127.0.0.1:18372/?token={self.settings_server.token}")
             return
 
         def on_save_success():
@@ -857,9 +904,9 @@ class FortiAutoConnApp(rumps.App):
         server_thread = threading.Thread(target=self.settings_server.start, daemon=True)
         server_thread.start()
         logger.info("[App] 설정용 로컬 웹 서버 시작 완료 (Port: 18372). 브라우저를 호출합니다.")
-        
-        # 기본 브라우저 자동 호출
-        webbrowser.open("http://127.0.0.1:18372/")
+
+        # 기본 브라우저 자동 호출 (CSRF 방어 토큰 포함)
+        webbrowser.open(f"http://127.0.0.1:18372/?token={self.settings_server.token}")
 
     def _load_credentials_from_keychain(self):
         """키체인의 단일 통합 설정 항목에서 자격 증명 로드"""
