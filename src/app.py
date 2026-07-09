@@ -336,7 +336,7 @@ class SettingsHTTPServer:
     <div class="container">
         <div class="header">
             <div class="logo">FortiAutoConn</div>
-            <div class="subtitle">보안 게이트웨이 및 인증 메일 계정 설정</div>
+            <div class="subtitle">보안 게이트웨이 및 IMAP 인증 메일 설정 (다음/카카오/네이버/Gmail 등)</div>
         </div>
         <form action="/save" method="POST">
             <input type="hidden" name="token" value="{form_token}">
@@ -391,11 +391,11 @@ class SettingsHTTPServer:
                 <input type="text" id="vpn_split_routes" name="vpn_split_routes" placeholder="10.0.0.0/8, 172.16.0.0/12" value="{vpn_split_routes}">
             </div>
 
-            <div class="section-title">✉️ 인증 메일 IMAP 설정</div>
+            <div class="section-title">✉️ 인증 메일 IMAP 설정 (다음, 카카오, 네이버, Gmail 등)</div>
             <div class="form-row">
                 <div class="form-group" style="flex: 2;">
                     <label for="mail_host">IMAP Host</label>
-                    <input type="text" id="mail_host" name="mail_host" placeholder="imap.daum.net" value="{mail_host}" required>
+                    <input type="text" id="mail_host" name="mail_host" placeholder="예: imap.daum.net / imap.naver.com" value="{mail_host}" required>
                 </div>
                 <div class="form-group" style="flex: 1;">
                     <label for="mail_port">IMAP Port</label>
@@ -404,8 +404,8 @@ class SettingsHTTPServer:
             </div>
             <div class="form-row">
                 <div class="form-group" style="flex: 2;">
-                    <label for="mail_user">Mail Address / ID</label>
-                    <input type="text" id="mail_user" name="mail_user" placeholder="이메일 주소 또는 ID" value="{mail_user}" required>
+                    <label for="mail_user">Mail Address (이메일 주소 전체)</label>
+                    <input type="text" id="mail_user" name="mail_user" placeholder="example@email.com" value="{mail_user}" required>
                 </div>
                 <div class="form-group" style="flex: 1;">
                     <label for="mail_folder">Mail Folder</label>
@@ -415,11 +415,11 @@ class SettingsHTTPServer:
             <div class="form-row">
                 <div class="form-group">
                     <label for="mail_pass">Mail Password</label>
-                    <input type="password" id="mail_pass" name="mail_pass" placeholder="기존 비밀번호 유지 시 빈 칸">
+                    <input type="password" id="mail_pass" name="mail_pass" placeholder="기존 비밀번호 유지 시 빈 칸 (2단계 인증자는 '앱 비밀번호')">
                 </div>
                 <div class="form-group">
                     <label for="otp_sender">인증 메일 발신자</label>
-                    <input type="text" id="otp_sender" name="otp_sender" placeholder="인증 코드 메일의 발신 주소" value="{otp_sender}" required>
+                    <input type="text" id="otp_sender" name="otp_sender" placeholder="예: it@daily-funding.com" value="{otp_sender}" required>
                 </div>
             </div>
 
