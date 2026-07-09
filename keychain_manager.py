@@ -1,29 +1,39 @@
 import sys
-import objc
 import keyring
-from LocalAuthentication import LAContext, LAPolicyDeviceOwnerAuthentication
-from Foundation import NSRunLoop, NSDate
 from logger import logger
 
 class KeychainManager:
     @staticmethod
     def authenticate_touch_id(reason="VPN 연결을 위한 Touch ID 인증"):
         """
-        macOS Touch ID 지문인식 또는 시스템 암호 인증을 트리거합니다.
-        동기적으로 처리하기 위해 NSRunLoop를 사용하여 대기합니다.
+        macOS Touch ID 또는 Windows Hello 인증을 트리거합니다.
+        각 OS 환경에 맞춰 네이티브 인증을 동기적으로 대기 처리합니다.
         """
+        if sys.platform == "darwin":
+            return KeychainManager._authenticate_mac(reason)
+        elif sys.platform == "win32":
+            return KeychainManager._authenticate_windows(reason)
+        else:
+            logger.info(f"[KeychainManager] {sys.platform} 환경에서는 자격증명 인증을 건너뜁니다.")
+            return True
+
+    @staticmethod
+    def _authenticate_mac(reason):
+        """macOS Touch ID 지문인식 또는 시스템 암호 인증"""
+        try:
+            import objc
+            from LocalAuthentication import LAContext, LAPolicyDeviceOwnerAuthentication
+            from Foundation import NSRunLoop, NSDate
+        except ImportError as e:
+            logger.error(f"[KeychainManager] macOS 필수 라이브러리를 임포트할 수 없습니다: {e}")
+            return False
+
         context = LAContext.alloc().init()
-        
-        # 시스템 암호 대체 수단도 허용하는 정책 (LAPolicyDeviceOwnerAuthentication)
         policy = LAPolicyDeviceOwnerAuthentication
         
-        # 지원 여부 확인
         can_evaluate, error = context.canEvaluatePolicy_error_(policy, None)
         if not can_evaluate:
             logger.error(f"[KeychainManager] 생체/비밀번호 인증을 사용할 수 없습니다: {error}")
-            # Touch ID가 지원되지 않는 환경이라면(예: 클램쉘 모드 등에서 지문 센서 사용 불가 시)
-            # 시스템 암호 입력 창이 뜨도록 처리되거나, 시스템 설정을 요구합니다.
-            # 여기서는 명시적으로 False를 반환하되, 일반 비밀번호 수동 입력을 백업으로 고려할 수 있습니다.
             return False
 
         auth_result = {"success": False, "completed": False}
@@ -34,14 +44,12 @@ class KeychainManager:
             if not success and error:
                 logger.warning(f"[KeychainManager] 인증 실패: {error}")
 
-        # 비동기 인증 호출
         context.evaluatePolicy_localizedReason_reply_(
             policy,
             reason,
             reply_handler
         )
 
-        # 비동기 콜백이 실행 완료될 때까지 RunLoop를 돌며 동기 대기
         run_loop = NSRunLoop.currentRunLoop()
         while not auth_result["completed"]:
             run_loop.runMode_beforeDate_(
@@ -52,8 +60,62 @@ class KeychainManager:
         return auth_result["success"]
 
     @staticmethod
+    def _authenticate_windows(reason):
+        """Windows Hello (지문, 안면, PIN) 또는 시스템 계정 비밀번호 인증"""
+        try:
+            import asyncio
+            from winsdk.windows.security.credentials.ui import UserConsentVerifier, UserConsentVerificationResult
+        except ImportError:
+            logger.error("[KeychainManager] Windows Hello를 위한 winsdk 라이브러리가 설치되어 있지 않습니다. pip install winsdk를 실행해 주세요.")
+            return False
+
+        async def verify():
+            try:
+                # API 사용 가능 여부 검사
+                availability = await UserConsentVerifier.check_api_availability_async()
+                # UserConsentVerifierAvailability.AVAILABLE = 0
+                if availability != 0:
+                    logger.warning(f"[KeychainManager] Windows Hello API 사용 불가능 (코드: {availability})")
+                    return False
+
+                # 인증 요청
+                result = await UserConsentVerifier.request_verification_async(reason)
+                # UserConsentVerificationResult.VERIFIED = 0
+                return result == 0
+            except Exception as e:
+                logger.error(f"[KeychainManager] Windows Hello 요청 중 예외 발생: {e}")
+                return False
+
+        try:
+            # asyncio 이벤트 루프가 이미 있는 경우와 없는 경우를 나눠 처리
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+
+            if loop.is_running():
+                # 이미 루프가 돌고 있다면 새로운 스레드에서 구동하거나 future를 동기 대기
+                import threading
+                result_holder = []
+                def run_in_thread():
+                    new_loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(new_loop)
+                    result_holder.append(new_loop.run_until_complete(verify()))
+                    new_loop.close()
+                t = threading.Thread(target=run_in_thread)
+                t.start()
+                t.join()
+                return result_holder[0] if result_holder else False
+            else:
+                return loop.run_until_complete(verify())
+        except Exception as e:
+            logger.error(f"[KeychainManager] Windows Hello 동기 대기 에러: {e}")
+            return False
+
+    @staticmethod
     def get_password(service, username):
-        """macOS 키체인에서 안전하게 암호를 가져옵니다."""
+        """키체인/자격증명 관리자에서 안전하게 암호를 가져옵니다."""
         try:
             return keyring.get_password(service, username)
         except Exception as e:
@@ -62,7 +124,7 @@ class KeychainManager:
 
     @staticmethod
     def save_password(service, username, password):
-        """macOS 키체인에 암호를 안전하게 저장합니다."""
+        """키체인/자격증명 관리자에 암호를 안전하게 저장합니다."""
         try:
             keyring.set_password(service, username, password)
             return True
@@ -72,7 +134,7 @@ class KeychainManager:
 
     @staticmethod
     def delete_password(service, username):
-        """macOS 키체인에서 정보를 삭제합니다."""
+        """키체인/자격증명 관리자에서 정보를 삭제합니다."""
         try:
             keyring.delete_password(service, username)
             return True
