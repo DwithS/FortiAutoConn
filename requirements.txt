@@ -1,6 +1,9 @@
-rumps>=0.4.0
 keyring>=24.0.0
-pyobjc-core>=9.0
-pyobjc-framework-LocalAuthentication>=9.0
-pyobjc-framework-Cocoa>=9.0
-pexpect>=4.8.0
+pillow>=10.0.0; sys_platform == "win32"
+pystray>=0.19.5; sys_platform == "win32"
+pyinstaller>=6.0.0; sys_platform == "win32"
+rumps>=0.4.0; sys_platform == "darwin"
+pyobjc-core>=9.0; sys_platform == "darwin"
+pyobjc-framework-LocalAuthentication>=9.0; sys_platform == "darwin"
+pyobjc-framework-Cocoa>=9.0; sys_platform == "darwin"
+pexpect>=4.8.0; sys_platform == "darwin"

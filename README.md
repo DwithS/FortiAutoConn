@@ -92,6 +92,42 @@ chmod +x setup.sh
 ### VPN 연결 해제 (수동)
 *   🟢 아이콘 클릭 ➔ **`Disconnect VPN`** 선택 시 즉시 터널이 철거되며 🔴 상태로 돌아갑니다.
 
+---
+
+## 🪟 Windows 포팅 프로토타입
+
+현재 Windows 경로는 **B안 MVP**입니다. FortiClient Standalone 7.4.7 및 FortiClient 8.0.0 문서에는 `FortiVPN.exe --cli --connect --tunnel <tunnelname> [--username <username>] [--password <password>] [--savecredentials] [--keeprunning]`가 제공된다고 되어 있습니다. 단, 이 기능은 FortiClient GUI/EMS에 이미 구성된 터널만 연결할 수 있고 새 터널 생성은 지원하지 않으며, 문서상 OTP 코드 입력 인자는 없습니다. 현재 확인한 로컬 설치본은 FortiClient VPN 7.4.3.1790이고 `FortiVPN.exe --cli` 실행 시 `Option 'cli' does not exist`가 반환되어 A안 자동 연결을 사용할 수 없습니다.
+
+Windows MVP는 다음 흐름을 제공합니다.
+
+1. FortiClient VPN UI 실행
+2. 사용자가 FortiClient에서 연결 시작
+3. FortiAutoConn이 IMAP OTP 메일을 감시
+4. OTP 발견 시 Windows 클립보드에 복사
+5. `안전 자동 붙여넣기`가 켜져 있고 FortiClient 창이 활성 상태이면 Ctrl+V 자동 전송, 아니면 사용자가 FortiClient OTP 입력 칸에 붙여넣기
+
+실행/패키징:
+
+```bat
+dist\FortiAutoConn.exe          :: Windows tray 상주 앱 실행 (기본, UAC 요청 없음)
+dist\FortiAutoConn.exe settings :: 설정 페이지 열기 (UAC 요청 없음)
+dist\FortiAutoConn.exe status   :: FortiClient 경로와 CLI 가능성 점검 (UAC 요청 없음)
+
+:: exe 재빌드
+.venv\Scripts\python.exe -m PyInstaller FortiAutoConn.spec
+```
+
+Tray 메뉴:
+
+*   **Settings**: 로컬 설정 페이지를 엽니다.
+*   **Status**: FortiClient 감지 여부, 메일 설정 여부, 자동 OTP 감시/붙여넣기 상태를 표시합니다.
+*   **Run at Windows startup**: Windows 로그인 시 tray 자동실행을 켜거나 끕니다.
+*   **Quit**: tray 앱을 종료합니다.
+
+Tray 실행 시 OTP 메일 감시와 안전 자동 붙여넣기는 기본값 `true`로 동작합니다. FortiClient/FortiVPN 창이 없으면 메일 감시는 휴면 상태로 대기하고, 창이 감지되면 활성화됩니다. OTP 복사 후 토큰 칸의 기존 값을 Ctrl+A로 선택하고 Delete로 비운 뒤 Ctrl+V와 Enter를 보냅니다. Windows 자동실행은 Startup 폴더에 숨김 실행용 `FortiAutoConn.vbs` 런처를 등록하므로 로그인 시 cmd 창을 띄우지 않습니다.
+
+Windows 설정은 `%APPDATA%\FortiAutoConn\config.json`에 저장되고, 메일 비밀번호는 `keyring`을 통해 Windows Credential Manager에 저장됩니다. FortiClient CLI 자동 연결이 가능한 사내 배포판/버전이 확인되면 `windows_app.py`의 `probe_forticlient_cli()` 결과를 기준으로 A안 백엔드를 추가할 수 있습니다.
+
 ### 자동 재연결 세부 사항
 *   사용자가 `Disconnect VPN`을 명시적으로 누른 것이 아님에도 외부 요인(8시간 세션 무효화, Wi-Fi 신호 유실 등)으로 인해 접속이 차단되면, 시스템이 이를 즉시 파악하고 10초 후에 조용히 백그라운드 재접속 작업을 돌립니다.
 *   이때는 최초 연결 당시 확보한 활성 세션(캐시)을 쓰기 때문에 Touch ID를 추가로 인식시킬 필요가 전혀 없어 매우 자연스러운 무중단 업무 지속이 보장됩니다.

@@ -68,6 +68,7 @@ MANIFEST
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
+!FortiAutoConn.spec
 
 # Installer logs
 pip-log.txt
@@ -226,3 +227,9 @@ pyrightconfig.json
 .ionide
 
 # End of https://www.toptal.com/developers/gitignore/api/python,macos,visualstudiocode
+
+# Build files
+build/
+build-window/
+dist/
+dist-window/
