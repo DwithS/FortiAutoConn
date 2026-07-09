@@ -12,14 +12,15 @@ def get_paths():
     startup_dir = os.path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
     shortcut_path = os.path.join(startup_dir, "FortiAutoConn.lnk")
     
-    # run.bat이 있는 절대 경로 확인
+    # run.bat이 있는 절대 경로 확인 (현재 파일이 src/에 있으므로 부모 디렉토리가 루트)
     current_dir = os.path.abspath(os.path.dirname(__file__))
-    target_path = os.path.join(current_dir, "run.bat")
+    parent_dir = os.path.abspath(os.path.join(current_dir, ".."))
+    target_path = os.path.join(parent_dir, "run.bat")
     
-    return startup_dir, shortcut_path, target_path, current_dir
+    return startup_dir, shortcut_path, target_path, parent_dir
 
 def install():
-    startup_dir, shortcut_path, target_path, current_dir = get_paths()
+    startup_dir, shortcut_path, target_path, parent_dir = get_paths()
     
     if not os.path.exists(target_path):
         logger.error(f"[Autostart] 대상 실행 파일({target_path})이 존재하지 않습니다. 먼저 setup.bat을 실행해 주세요.")
@@ -33,7 +34,7 @@ def install():
     $WshShell = New-Object -ComObject WScript.Shell
     $Shortcut = $WshShell.CreateShortcut('{shortcut_path}')
     $Shortcut.TargetPath = '{target_path}'
-    $Shortcut.WorkingDirectory = '{current_dir}'
+    $Shortcut.WorkingDirectory = '{parent_dir}'
     $Shortcut.WindowStyle = 7
     $Shortcut.Description = 'FortiAutoConn Auto Start'
     $Shortcut.Save()

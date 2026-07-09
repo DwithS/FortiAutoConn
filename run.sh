@@ -47,4 +47,4 @@ if [ ! -x "$LAUNCHER" ] || ! "$LAUNCHER" -c "" 2>/dev/null; then
     LAUNCHER="$REAL"
 fi
 
-exec "$LAUNCHER" app.py
+exec "$LAUNCHER" src/app.py

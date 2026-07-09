@@ -45,5 +45,5 @@ echo [+] FortiAutoConn 트레이 앱을 백그라운드로 가동합니다.
 echo [안내] 작업 표시줄 오른쪽 아래 알림 영역(트레이)에서 아이콘을 클릭하여 설정 및 VPN 연결을 수행할 수 있습니다.
 echo.
 
-python app_windows.py
+python src/app_windows.py
 exit /b 0

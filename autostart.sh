@@ -80,7 +80,7 @@ install_agent() {
     <key>ProgramArguments</key>
     <array>
         <string>$PYTHON_BIN</string>
-        <string>$PROJECT_DIR/app.py</string>
+        <string>$PROJECT_DIR/src/app.py</string>
     </array>
     <key>WorkingDirectory</key>
     <string>$PROJECT_DIR</string>
