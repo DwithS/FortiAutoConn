@@ -8,7 +8,7 @@ connect/password/OTP interface. Therefore this module implements B안:
 - store settings in %APPDATA% + secrets in Windows Credential Manager via keyring
 - open the FortiClient VPN UI
 - watch the configured IMAP mailbox for the OTP
-- copy the OTP to the Windows clipboard so the user can paste it into FortiClient
+- copy the OTP to the Windows clipboard and paste it into the active FortiClient window when safe
 """
 
 from __future__ import annotations
@@ -44,9 +44,10 @@ SETTINGS_PORT = 18372
 TRAY_MUTEX_NAME = "Local\\FortiAutoConn.Tray"
 STARTUP_LAUNCHER_NAME = "FortiAutoConn.vbs"
 LEGACY_STARTUP_CMD_NAME = "FortiAutoConn.cmd"
-DEFAULT_FORTICLIENT_PATHS = [
-    Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Fortinet" / "FortiClient" / "FortiVPN.exe",
-    Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Fortinet" / "FortiClient" / "FortiClient.exe",
+DEFAULT_CONNECT_BUTTON_LABELS = ("연결", "Connect", "CONNECT", "접속", "VPN 연결")
+FORTICLIENT_LAUNCH_PATH = Path(r"C:\Program Files\Fortinet\FortiClient\FortiClient.exe")
+DEFAULT_FORTIVPN_CLI_PATHS = [
+    FORTICLIENT_LAUNCH_PATH.with_name("FortiVPN.exe"),
     Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Fortinet" / "FortiClient" / "FortiVPN.exe",
 ]
 
@@ -222,10 +223,14 @@ class WindowsConfig:
     @classmethod
     def load(cls) -> dict:
         merged = cls._read_plain()
+        if "forticlient_path" in merged:
+            merged.pop("forticlient_path", None)
+            cls._write_plain(merged)
         # Windows tray MVP keeps OTP watching and safe auto-paste enabled by default.
         # The tray no longer exposes toggles for these internal defaults.
         merged["auto_watch_otp"] = "true"
         merged["auto_paste_otp"] = "true"
+        merged.setdefault("auto_click_connect", "true")
         merged.update(cls._read_secret())
         return merged
 
@@ -245,13 +250,43 @@ class WindowsConfig:
 
 
 def find_forticlient() -> Path | None:
-    configured = WindowsConfig.load().get("forticlient_path")
-    candidates = [Path(configured)] if configured else []
-    candidates.extend(DEFAULT_FORTICLIENT_PATHS)
+    return FORTICLIENT_LAUNCH_PATH if FORTICLIENT_LAUNCH_PATH.exists() else None
+
+
+def find_fortivpn_cli() -> Path | None:
+    candidates: list[Path] = []
+    for path in DEFAULT_FORTIVPN_CLI_PATHS:
+        if path not in candidates:
+            candidates.append(path)
     for path in candidates:
         if path and path.exists():
             return path
     return None
+
+
+def _popen_no_console(path: Path) -> None:
+    env = os.environ.copy()
+    for key in list(env):
+        if key.startswith("_PYI") or key.startswith("PYINSTALLER"):
+            env.pop(key, None)
+    kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "cwd": str(path.parent), "env": env}
+    if os.name == "nt":
+        # FortiClient needs its install directory as CWD and must not inherit
+        # PyInstaller's temporary DLL search path.
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.SetDllDirectoryW.argtypes = (ctypes.c_wchar_p,)
+        kernel32.SetDllDirectoryW.restype = ctypes.c_bool
+        meipass = getattr(sys, "_MEIPASS", None)
+        kernel32.SetDllDirectoryW(None)
+        try:
+            subprocess.Popen([str(path)], **kwargs)
+        finally:
+            if meipass:
+                kernel32.SetDllDirectoryW(str(meipass))
+        return
+
+    subprocess.Popen([str(path)], **kwargs)
 
 
 def probe_forticlient_cli(path: Path) -> str:
@@ -395,20 +430,6 @@ def is_running_as_admin() -> bool:
         return False
 
 
-def relaunch_tray_as_admin() -> bool:
-    """Ask UAC to start a new elevated tray process. The current process cannot elevate in-place."""
-    if os.name != "nt":
-        return False
-    try:
-        app_path = Path(__file__).with_name("app.py")
-        params = f'"{app_path}" tray'
-        result = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, str(Path.cwd()), 1)
-        return int(result) > 32
-    except Exception as exc:
-        logger.warning(f"[Windows] 관리자 권한 재실행 실패: {exc}")
-        return False
-
-
 def get_active_window_title() -> str:
     """Return the foreground window title on Windows; empty on failure/non-Windows."""
     if os.name != "nt":
@@ -429,7 +450,11 @@ def get_active_window_title() -> str:
 
 def _window_title_matches(title: str) -> bool:
     allowed = ("forticlient", "fortivpn", "forticlient vpn")
-    return any(token in title.lower() for token in allowed)
+    lowered = title.lower()
+    blocked = ("fortiautoconn", "파일 탐색기", "file explorer", "explorer")
+    if any(token in lowered for token in blocked):
+        return False
+    return any(token in lowered for token in allowed)
 
 
 def find_forticlient_window_title() -> str:
@@ -502,6 +527,85 @@ def focus_forticlient_window() -> tuple[bool, str]:
         logger.warning(f"[Windows] FortiClient 창 전면 전환 실패: {exc}")
         return False, str(exc)
 
+
+def wait_for_forticlient_window(timeout_seconds: float = 20.0) -> tuple[bool, str]:
+    """Wait until a visible FortiClient/FortiVPN window appears."""
+    deadline = time.monotonic() + timeout_seconds
+    last_title = ""
+    while time.monotonic() < deadline:
+        last_title = find_forticlient_window_title()
+        if last_title:
+            return True, last_title
+        time.sleep(0.25)
+    return False, last_title or "FortiClient/FortiVPN 창을 찾지 못했습니다."
+
+
+def _connect_button_labels(config: dict) -> tuple[str, ...]:
+    configured = config.get("connect_button_labels") or ""
+    labels = [label.strip() for label in configured.split(",") if label.strip()]
+    labels.extend(DEFAULT_CONNECT_BUTTON_LABELS)
+    deduped: list[str] = []
+    for label in labels:
+        if label not in deduped:
+            deduped.append(label)
+    return tuple(deduped)
+
+
+def click_forticlient_connect_button(config: dict, timeout_seconds: float = 20.0) -> tuple[bool, str]:
+    """Click FortiClient's Connect button using Windows UI Automation when available."""
+    if config.get("auto_click_connect", "true") != "true":
+        return False, "자동 연결 버튼 클릭이 꺼져 있습니다."
+    if os.name != "nt":
+        return False, "Windows에서만 FortiClient UI 자동 조작을 지원합니다."
+
+    window_ready, window_message = wait_for_forticlient_window(timeout_seconds)
+    if not window_ready:
+        return False, window_message
+
+    try:
+        from pywinauto import Application
+    except ImportError:
+        return False, "pywinauto가 설치되지 않아 연결 버튼 자동 클릭을 사용할 수 없습니다. `uv pip install -r requirements.txt` 후 다시 실행해 주세요."
+
+    labels = _connect_button_labels(config)
+    lowered_labels = tuple(label.lower() for label in labels)
+    try:
+        app = Application(backend="uia").connect(title_re=".*(FortiClient|FortiVPN).*", timeout=timeout_seconds)
+        window = app.window(title_re=".*(FortiClient|FortiVPN).*")
+        window.wait("visible ready", timeout=timeout_seconds)
+        try:
+            window.set_focus()
+        except Exception:
+            focus_forticlient_window()
+
+        candidates = []
+        for control_type in ("Button", "SplitButton"):
+            try:
+                candidates.extend(window.descendants(control_type=control_type))
+            except Exception:
+                pass
+
+        seen_names: list[str] = []
+        for candidate in candidates:
+            try:
+                name = (candidate.window_text() or candidate.element_info.name or "").strip()
+            except Exception:
+                name = ""
+            if name:
+                seen_names.append(name)
+            normalized = name.lower()
+            if not normalized:
+                continue
+            if "disconnect" in normalized or "해제" in normalized or "끊" in normalized:
+                continue
+            if any(label == normalized or label in normalized for label in lowered_labels):
+                candidate.click_input()
+                return True, f"FortiClient 연결 버튼을 클릭했습니다: {name}"
+
+        return False, "FortiClient 창은 찾았지만 UIA에서 연결 버튼을 찾지 못했습니다. 감지된 버튼: " + ", ".join(seen_names[:12])
+    except Exception as exc:
+        logger.warning(f"[Windows] FortiClient 연결 버튼 자동 클릭 실패: {exc}")
+        return False, f"FortiClient 연결 버튼 자동 클릭 실패: {exc}"
 
 def send_keyboard_shortcut_to_active_window(keys: list[int]) -> bool:
     """Send a keyboard shortcut to the active window via SendInput."""
@@ -654,13 +758,35 @@ def watch_otp_to_clipboard(config: dict, max_wait_seconds: int = 120) -> tuple[b
 
 
 def launch_forticlient() -> bool:
-    path = find_forticlient()
-    if not path:
-        print("FortiClient 실행 파일을 찾지 못했습니다. Settings에서 FortiClient Path를 지정해 주세요.")
-        return False
-    subprocess.Popen([str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    print(f"FortiClient 실행: {path}")
-    return True
+    if find_forticlient_window_title():
+        focused, message = focus_forticlient_window()
+        print(f"FortiClient 창 전면 전환: {message}")
+        if not focused:
+            logger.info(f"[Windows] FortiClient 창은 찾았지만 전면 전환은 실패했습니다: {message}")
+        return True
+
+    attempted: list[str] = []
+    for path in (FORTICLIENT_LAUNCH_PATH,):
+        if not path.exists():
+            continue
+        attempted.append(str(path))
+        try:
+            _popen_no_console(path)
+        except Exception as exc:
+            logger.warning(f"[Windows] FortiClient 실행 실패: path={path}, error={exc}")
+            continue
+        window_ready, window_message = wait_for_forticlient_window(timeout_seconds=20.0)
+        if window_ready:
+            focus_forticlient_window()
+            print(f"FortiClient 실행: {path}")
+            return True
+        logger.info(f"[Windows] FortiClient 실행 후 창 감지 실패: path={path}, result={window_message}")
+
+    if attempted:
+        print("FortiClient 실행은 시도했지만 창을 찾지 못했습니다. 시도한 파일: " + ", ".join(attempted))
+    else:
+        print(f"FortiClient 실행 파일을 찾지 못했습니다: {FORTICLIENT_LAUNCH_PATH}")
+    return False
 
 
 class SettingsServer:
@@ -713,12 +839,13 @@ class SettingsServer:
                     return
                 config = WindowsConfig.load()
                 esc = lambda v: html.escape(v or "", quote=True)
-                forticlient_path = esc(config.get("forticlient_path") or str(find_forticlient() or ""))
                 mail_host = esc(config.get("mail_host") or "imap.daum.net")
                 mail_port = esc(config.get("mail_port") or "993")
                 mail_user = esc(config.get("mail_user") or "")
                 mail_folder = esc(config.get("mail_folder") or "INBOX")
                 otp_sender = esc(config.get("otp_sender") or MailChecker.DEFAULT_OTP_SENDER)
+                connect_button_labels = esc(config.get("connect_button_labels") or ", ".join(DEFAULT_CONNECT_BUTTON_LABELS))
+                auto_click_checked = "checked" if config.get("auto_click_connect", "true") == "true" else ""
                 form_token = esc(supplied)
                 page = f"""<!doctype html><html lang='ko'><head><meta charset='utf-8'>
 <title>FortiAutoConn Windows 설정</title>
@@ -735,13 +862,15 @@ class SettingsServer:
 <li>OTP Sender는 OTP 발신자 메일 주소입니다. 기본값이 맞지 않으면 실제 발신자로 바꿔 주세요.</li>
 </ul></div>
 <form method='post' action='/save'><input type='hidden' name='token' value='{form_token}'>
-<label>FortiClient Path</label><input name='forticlient_path' value='{forticlient_path}' placeholder='C:\\Program Files\\Fortinet\\FortiClient\\FortiVPN.exe'>
+<p style='color:#9ca3af;font-size:13px;line-height:1.5'>FortiClient 실행은 <code>C:\\Program Files\\Fortinet\\FortiClient\\FortiClient.exe</code>만 사용합니다.</p>
 <label>IMAP Host</label><input name='mail_host' value='{mail_host}' required>
 <label>IMAP Port</label><input name='mail_port' value='{mail_port}' required>
 <label>Mail Address / ID</label><input name='mail_user' value='{mail_user}' required>
 <label>Mail Folder</label><input name='mail_folder' value='{mail_folder}' required>
 <label>Mail Password</label><input type='password' name='mail_pass' placeholder='기존 비밀번호 유지 시 빈 칸'>
 <label>OTP Sender</label><input name='otp_sender' value='{otp_sender}' required>
+<label style='display:flex;gap:8px;align-items:center'><input type='checkbox' name='auto_click_connect' value='true' {auto_click_checked} style='width:auto'> FortiClient 연결 버튼 자동 클릭</label>
+<label>Connect Button Labels</label><input name='connect_button_labels' value='{connect_button_labels}' placeholder='연결, Connect'>
 <p style='color:#9ca3af;font-size:13px;line-height:1.5'>FortiClient 창이 열려 있을 때만 OTP 메일 감시가 활성화됩니다. OTP를 찾으면 토큰 칸에 Ctrl+A → Delete → Ctrl+V → Enter를 시도합니다.</p>
 <button type='submit'>저장</button></form></div></body></html>"""
                 self.send_response(200)
@@ -766,12 +895,13 @@ class SettingsServer:
                     self._deny(403, "Forbidden")
                     return
                 updates = {
-                    "forticlient_path": data.get("forticlient_path", ""),
                     "mail_host": data.get("mail_host", ""),
                     "mail_port": data.get("mail_port", ""),
                     "mail_user": data.get("mail_user", ""),
                     "mail_folder": data.get("mail_folder", "INBOX"),
                     "otp_sender": data.get("otp_sender", ""),
+                    "auto_click_connect": "true" if data.get("auto_click_connect") == "true" else "false",
+                    "connect_button_labels": data.get("connect_button_labels", ""),
                 }
                 if data.get("mail_pass"):
                     updates["mail_pass"] = data["mail_pass"]
@@ -830,8 +960,15 @@ def connect_flow() -> int:
     config = WindowsConfig.load()
     if not launch_forticlient():
         return 2
-    print("FortiClient에서 VPN 연결을 시작하세요. OTP 메일이 오면 자동 감지해 클립보드에 복사합니다.")
-    return watch_otp_once(config)
+    clicked, click_message = click_forticlient_connect_button(config)
+    print(click_message)
+    if not clicked:
+        print("FortiClient에서 VPN 연결을 수동으로 시작하면 OTP 메일을 자동 감지해 클립보드에 복사합니다.")
+    else:
+        print("OTP 메일이 오면 자동 감지해 클립보드에 복사하고 FortiClient에 제출합니다.")
+    ok, message = watch_otp_to_clipboard(config)
+    print(message)
+    return 0 if ok else 4
 
 
 class WindowsTrayApp:
@@ -857,16 +994,15 @@ class WindowsTrayApp:
     def _is_active(self, action: str):
         return lambda _item: self._active_action == action
 
-    def _auto_paste_enabled(self, _item=None) -> bool:
-        return WindowsConfig.load().get("auto_paste_otp") == "true"
-
     def _auto_watch_enabled(self, _item=None) -> bool:
         return bool(self._auto_watch_thread and self._auto_watch_thread.is_alive())
 
-    def _notify(self, title: str, message: str) -> None:
+    def _notify(self, title: str, message: str, *, show: bool = False) -> None:
         """Use non-modal tray notifications; never open a blocking message box."""
         log_message = re.sub(r"(토큰값:\s*)(\d{1})(\d+)", lambda m: m.group(1) + m.group(2) + "*" * len(m.group(3)), message)
         logger.info(f"[Windows Notify] {title}: {log_message}")
+        if not show and not message.startswith("토큰값:"):
+            return
         if not self.icon:
             print(f"{title}: {message}")
             return
@@ -878,7 +1014,7 @@ class WindowsTrayApp:
     def _run_worker(self, target, busy_title: str, action: str) -> None:
         with self._lock:
             if self._worker and self._worker.is_alive():
-                self._notify("FortiAutoConn", "이미 작업이 진행 중입니다.")
+                self._notify("FortiAutoConn", "이미 VPN 연결 작업이 진행 중입니다.", show=True)
                 return
             self._active_action = action
             self._set_title(busy_title)
@@ -922,6 +1058,7 @@ class WindowsTrayApp:
 
                 ok, message = watch_otp_to_clipboard(WindowsConfig.load(), max_wait_seconds=600)
                 if ok:
+                    self._set_title("FortiAutoConn - 토큰 입력 완료")
                     self._notify("FortiAutoConn", message)
                     # Keep watching for the next VPN reconnect. Duplicate OTP messages are
                     # skipped by MailChecker's consumed Message-ID cache.
@@ -936,16 +1073,22 @@ class WindowsTrayApp:
     def connect_and_watch(self, _icon=None, _item=None) -> None:
         def worker():
             try:
+                self._notify("FortiAutoConn", "VPN 연결을 진행 중입니다. FortiClient를 실행합니다.", show=True)
                 if not launch_forticlient():
-                    self._notify("FortiAutoConn", "FortiClient 실행 파일을 찾지 못했습니다. Settings에서 경로를 지정해 주세요.")
+                    self._notify("FortiAutoConn", f"FortiClient 실행 파일을 찾지 못했습니다: {FORTICLIENT_LAUNCH_PATH}", show=True)
                     return
                 self._ensure_auto_watch_running()
-                self._notify("FortiAutoConn", "FortiClient를 실행했고 자동 OTP 메일 감시를 켰습니다.")
+                clicked, click_message = click_forticlient_connect_button(WindowsConfig.load())
+                logger.info(f"[Windows Tray] 자동 연결 버튼 클릭 결과: clicked={clicked}, {click_message}")
+                if clicked:
+                    self._notify("FortiAutoConn", "FortiClient 연결을 시작했습니다. OTP 메일을 기다립니다.", show=True)
+                else:
+                    self._notify("FortiAutoConn", "FortiClient에서 연결 버튼을 직접 눌러 주세요. OTP는 자동으로 처리합니다.", show=True)
             finally:
                 if not self._auto_watch_enabled():
                     self._clear_active()
 
-        self._run_worker(worker, "FortiAutoConn - OTP 감시 중", "connect")
+        self._run_worker(worker, "FortiAutoConn", "connect")
 
     def watch_otp_only(self, _icon=None, _item=None) -> None:
         def worker():
@@ -967,28 +1110,13 @@ class WindowsTrayApp:
         msg = (
             f"FortiClient: {path or 'not found'}\n"
             f"Mail configured: {'yes' if mail_ok else 'no'}\n"
+            f"Auto connect click: {'on' if config.get('auto_click_connect') == 'true' else 'off'}\n"
             f"Auto watch: {'on' if config.get('auto_watch_otp') == 'true' else 'off'}\n"
             f"Auto paste: {'on' if config.get('auto_paste_otp') == 'true' else 'off'}\n"
             f"Startup: {'on' if is_startup_enabled() else 'off'}\n"
             f"Admin: {'yes' if is_running_as_admin() else 'no'}"
         )
         threading.Thread(target=show_status_window, args=(msg,), daemon=True).start()
-
-    def toggle_auto_paste(self, _icon=None, _item=None) -> None:
-        enabled = WindowsConfig.load().get("auto_paste_otp") == "true"
-        if not enabled and not is_running_as_admin():
-            WindowsConfig.save({"auto_paste_otp": "true"})
-            self._update_menu()
-            if relaunch_tray_as_admin():
-                self._notify("FortiAutoConn", "UAC 승인 후 관리자 권한 tray로 다시 실행합니다. 기존 tray는 종료됩니다.")
-                if self.icon:
-                    threading.Timer(1.0, self.icon.stop).start()
-            else:
-                self._notify("FortiAutoConn", "관리자 권한 재실행을 시작하지 못했습니다. 수동으로 run_windows_admin.bat을 실행해 주세요.")
-            return
-        WindowsConfig.save({"auto_paste_otp": "false" if enabled else "true"})
-        self._update_menu()
-        self._notify("FortiAutoConn", f"안전 자동 붙여넣기: {'OFF' if enabled else 'ON'}")
 
     def toggle_startup(self, _icon=None, _item=None) -> None:
         enabled = is_startup_enabled()
@@ -1000,17 +1128,6 @@ class WindowsTrayApp:
             return
         self._update_menu()
         self._notify("FortiAutoConn", f"Windows 시작 시 자동실행: {'OFF' if enabled else 'ON'}")
-
-    def toggle_auto_watch(self, _icon=None, _item=None) -> None:
-        enabled = WindowsConfig.load().get("auto_watch_otp") == "true"
-        WindowsConfig.save({"auto_watch_otp": "false" if enabled else "true"})
-        if enabled:
-            self._auto_watch_stop.set()
-            self._notify("FortiAutoConn", "자동 OTP 메일 감시: OFF")
-        else:
-            self._ensure_auto_watch_running()
-            self._notify("FortiAutoConn", "자동 OTP 메일 감시: ON")
-        self._update_menu()
 
     def quit(self, icon, _item=None) -> None:
         self._auto_watch_stop.set()
@@ -1035,6 +1152,7 @@ class WindowsTrayApp:
             return 2
 
         menu = pystray.Menu(
+            pystray.MenuItem("Connect", self.connect_and_watch),
             pystray.MenuItem("Settings", self.open_settings),
             pystray.MenuItem("Status", self.show_status),
             pystray.MenuItem("Run at Windows startup", self.toggle_startup, checked=lambda _item: is_startup_enabled()),
@@ -1064,13 +1182,15 @@ def run_tray() -> int:
 
 def status() -> int:
     path = find_forticlient()
+    cli_path = find_fortivpn_cli()
     print(f"Config file: {CONFIG_FILE}")
     print(f"FortiClient: {path or 'not found'}")
-    if path:
+    if cli_path:
         print("CLI probe:")
-        print(probe_forticlient_cli(path))
+        print(probe_forticlient_cli(cli_path))
     config = WindowsConfig.load()
     print(f"Mail configured: {'yes' if all(config.get(k) for k in ('mail_host', 'mail_port', 'mail_user', 'mail_pass')) else 'no'}")
+    print(f"Auto connect click: {'on' if config.get('auto_click_connect') == 'true' else 'off'}")
     print(f"Auto watch: {'on' if config.get('auto_watch_otp') == 'true' else 'off'}")
     print(f"Auto paste: {'on' if config.get('auto_paste_otp') == 'true' else 'off'}")
     print(f"Startup: {'on' if is_startup_enabled() else 'off'}")

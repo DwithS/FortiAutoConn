@@ -1,6 +1,7 @@
 keyring>=24.0.0
 pillow>=10.0.0; sys_platform == "win32"
 pystray>=0.19.5; sys_platform == "win32"
+pywinauto>=0.6.8; sys_platform == "win32"
 pyinstaller>=6.0.0; sys_platform == "win32"
 rumps>=0.4.0; sys_platform == "darwin"
 pyobjc-core>=9.0; sys_platform == "darwin"

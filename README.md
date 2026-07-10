@@ -101,10 +101,12 @@ chmod +x setup.sh
 Windows MVP는 다음 흐름을 제공합니다.
 
 1. FortiClient VPN UI 실행
-2. 사용자가 FortiClient에서 연결 시작
+2. Windows UI Automation(`pywinauto`)으로 FortiClient의 `연결`/`Connect` 버튼 클릭 시도
 3. FortiAutoConn이 IMAP OTP 메일을 감시
 4. OTP 발견 시 Windows 클립보드에 복사
 5. `안전 자동 붙여넣기`가 켜져 있고 FortiClient 창이 활성 상태이면 Ctrl+V 자동 전송, 아니면 사용자가 FortiClient OTP 입력 칸에 붙여넣기
+
+연결 버튼이 UI Automation에 노출되지 않는 FortiClient 버전/배포판에서는 자동 클릭만 건너뛰고 기존 B안처럼 FortiClient 창을 띄운 뒤 사용자가 연결 버튼을 누르면 OTP 감시/붙여넣기는 계속 동작합니다. Settings의 `Connect Button Labels`에서 버튼명이 다른 사내 배포판의 라벨을 쉼표로 추가할 수 있습니다. Windows 실행 경로는 `C:\Program Files\Fortinet\FortiClient\FortiClient.exe` 하나만 사용합니다.
 
 실행/패키징:
 
@@ -119,6 +121,7 @@ dist\FortiAutoConn.exe status   :: FortiClient 경로와 CLI 가능성 점검 (U
 
 Tray 메뉴:
 
+*   **Connect**: FortiClient를 열고 연결 버튼 자동 클릭을 시도한 뒤 OTP 감시/붙여넣기를 진행합니다.
 *   **Settings**: 로컬 설정 페이지를 엽니다.
 *   **Status**: FortiClient 감지 여부, 메일 설정 여부, 자동 OTP 감시/붙여넣기 상태를 표시합니다.
 *   **Run at Windows startup**: Windows 로그인 시 tray 자동실행을 켜거나 끕니다.
