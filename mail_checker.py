@@ -211,7 +211,13 @@ class MailChecker:
 
     def _scan_for_otp(self, mail, sender_filter, code_pattern, start_time):
         """선택된 메일함에서 신규 OTP 메일을 1회 스캔합니다. (연결/로그인 없음)"""
+        # 진단: SEARCH 왕복 시간을 측정합니다. 좀비 커넥션이면 여기서 소켓 타임아웃까지
+        # 블록되므로, 이 값이 8초에 근접하면 커넥션이 죽은 것으로 판단할 수 있습니다.
+        t0 = time.monotonic()
         status, messages = mail.search(None, f'FROM "{sender_filter}"')
+        search_ms = (time.monotonic() - t0) * 1000
+        matched = len(messages[0].split()) if (status == "OK" and messages and messages[0]) else 0
+        logger.debug(f"[MailChecker] SEARCH 완료: {search_ms:.0f}ms, 매칭 {matched}건 (status={status})")
         if status != "OK" or not messages[0]:
             return None
 
@@ -326,9 +332,12 @@ class MailChecker:
                         return None
                     login_attempts += 1
                     try:
+                        t0 = time.monotonic()
                         mail = self._connect_and_login()
                         select_param = self._resolve_target_folder(mail)
                         selected = False
+                        logger.debug(f"[MailChecker] 접속+로그인+폴더해석 완료: {(time.monotonic() - t0) * 1000:.0f}ms "
+                                     f"(시도 {login_attempts}/{self.MAX_LOGIN_ATTEMPTS})")
                     except imaplib.IMAP4.error as e:
                         logger.error(f"[MailChecker] 메일 로그인 거부: {e}. 계정 접근제한 방지를 위해 재시도하지 않습니다.")
                         return None
@@ -340,9 +349,15 @@ class MailChecker:
                         continue
 
                 # 2) 폴더 선택은 커넥션당 1회만, 이후 폴링은 SEARCH만 반복 (추가 로그인/SELECT 없음)
+                logger.debug(f"[MailChecker] 폴링 스캔 시작 (경과 {elapsed:.1f}s, selected={selected})")
+                # 진단: 이 try 블록에서 소요/블록된 시간을 측정합니다. 예외 발생 시 이 값이
+                # 소켓 타임아웃(8초)에 근접하면 좀비(half-open) 커넥션이 원인임을 확증할 수 있습니다.
+                op_start = time.monotonic()
                 try:
                     if not selected:
+                        t0 = time.monotonic()
                         status, _ = direct_imap_select(mail, select_param)
+                        logger.debug(f"[MailChecker] SELECT 완료: {(time.monotonic() - t0) * 1000:.0f}ms (status={status})")
                         if status != "OK":
                             raise RuntimeError(f"메일함 {repr(select_param)} 선택 실패 (상태: {status})")
                         selected = True
@@ -351,7 +366,9 @@ class MailChecker:
                     if otp_code:
                         return otp_code
                 except Exception as e:
-                    logger.warning(f"[MailChecker] 메일 확인 중 연결 오류 감지, 재접속을 준비합니다: {e}")
+                    blocked_ms = (time.monotonic() - op_start) * 1000
+                    logger.warning(f"[MailChecker] 메일 확인 중 연결 오류 감지, 재접속을 준비합니다 "
+                                   f"(블록 {blocked_ms:.0f}ms): {e}")
                     try:
                         mail.logout()
                     except Exception:

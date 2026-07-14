@@ -16,7 +16,9 @@ def setup_logger():
     if logger.handlers:
         return logger
         
-    logger.setLevel(logging.INFO)
+    # 환경변수 FORTI_DEBUG가 설정되면 DEBUG 레벨로 승격하여 IMAP 폴링 타이밍 등
+    # 진단용 상세 로그를 노출합니다. (예: FORTI_DEBUG=1 ./run.sh)
+    logger.setLevel(logging.DEBUG if os.environ.get("FORTI_DEBUG") else logging.INFO)
     
     # 시간, 레벨, 파일명/줄번호, 메시지 형식 지정
     formatter = logging.Formatter('[%(asctime)s] [%(levelname)s] [%(filename)s:%(lineno)d] %(message)s')
