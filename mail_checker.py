@@ -95,7 +95,9 @@ OTP_CODE_PATTERN = re.compile(r"(?:AuthCode:\s*|Your authentication token code i
 
 class MailChecker:
     # 계정 접근제한(과다 로그인 차단) 방지: 한 번의 OTP 감시 동안 허용되는 최대 IMAP 로그인 횟수
-    MAX_LOGIN_ATTEMPTS = 3
+    # (소켓 타임아웃을 8초로 낮춰 좀비 커넥션을 빨리 포기하는 대신, 재접속 여유를 5회로 늘려
+    #  메일 도착 전에 한도가 소진돼 감시를 포기하는 일이 없게 균형을 맞춥니다. 90초/5회는 잠금 안전 범위.)
+    MAX_LOGIN_ATTEMPTS = 5
 
     # 인증(OTP) 메일 발신자 기본값. Settings에서 otp_sender로 변경 가능합니다.
     DEFAULT_OTP_SENDER = "it@daily-funding.com"
@@ -123,7 +125,10 @@ class MailChecker:
         네트워크 장애가 아닌 '서버의 명시적 로그인 거부'는 재시도해도 절대 성공할 수 없고,
         반복하면 메일 계정이 접근제한에 걸리므로 auth_failed 플래그를 세우고 즉시 예외를 전파합니다.
         """
-        mail = imaplib.IMAP4_SSL(self.host, self.port, timeout=15)
+        # 좀비(half-open) 커넥션을 오래 붙잡지 않도록 소켓 타임아웃을 짧게 둡니다.
+        # 원격 IMAP 프런트가 유휴 커넥션을 조용히 폐기하면 응답이 영영 오지 않는데,
+        # 이 시간이 곧 '죽은 커넥션을 감지해 재접속하기까지의 낭비 시간'이 됩니다.
+        mail = imaplib.IMAP4_SSL(self.host, self.port, timeout=8)
         try:
             mail.login(self.username, self.password)
         except imaplib.IMAP4.error:
@@ -288,8 +293,12 @@ class MailChecker:
         sender_filter를 생략하면 설정된 otp_sender(기본 DEFAULT_OTP_SENDER)를 사용합니다.
 
         계정 접근제한(과다 로그인 차단) 방지 설계:
-        - IMAP 로그인은 1회만 수행하고 같은 연결을 재사용하며 3초마다 재검색만 합니다.
+        - IMAP 로그인은 1회만 수행하고 같은 연결을 재사용하며 1.5초마다 재검색만 합니다.
           (기존에는 3초마다 새로 로그인해 감시 1회당 ~30회의 로그인이 발생, 접근제한의 원인)
+        - 폴더 SELECT도 커넥션당 1회만 수행하고, 이후 폴링은 SEARCH만 반복합니다.
+          (SELECT은 IMAP 왕복이 무거워 폴링마다 반복하면 지연이 커지고, 이번처럼 SELECT 응답
+           대기 중 좀비 커넥션에 걸릴 확률도 높아집니다. SELECT된 메일함에 도착한 신규 메일은
+           재-SELECT 없이도 SEARCH가 다시 평가해 잡아냅니다.)
         - 서버가 로그인을 거부하면(비밀번호 오류) 즉시 중단하고 auth_failed=True를 세웁니다.
         - 네트워크 장애로 인한 재접속도 최대 MAX_LOGIN_ATTEMPTS회로 제한합니다.
         """
@@ -305,6 +314,8 @@ class MailChecker:
         mail = None
         select_param = None
         login_attempts = 0
+        # 폴더 SELECT는 커넥션당 1회만 수행하기 위한 플래그. 재접속하면 다시 False로 돌아갑니다.
+        selected = False
 
         try:
             while elapsed < max_wait_seconds:
@@ -317,6 +328,7 @@ class MailChecker:
                     try:
                         mail = self._connect_and_login()
                         select_param = self._resolve_target_folder(mail)
+                        selected = False
                     except imaplib.IMAP4.error as e:
                         logger.error(f"[MailChecker] 메일 로그인 거부: {e}. 계정 접근제한 방지를 위해 재시도하지 않습니다.")
                         return None
@@ -327,11 +339,13 @@ class MailChecker:
                         elapsed = (datetime.datetime.now(datetime.timezone.utc) - start_time).total_seconds()
                         continue
 
-                # 2) 같은 세션에서 폴더 재선택 + 신규 메일 스캔 (추가 로그인 없음)
+                # 2) 폴더 선택은 커넥션당 1회만, 이후 폴링은 SEARCH만 반복 (추가 로그인/SELECT 없음)
                 try:
-                    status, _ = direct_imap_select(mail, select_param)
-                    if status != "OK":
-                        raise RuntimeError(f"메일함 {repr(select_param)} 선택 실패 (상태: {status})")
+                    if not selected:
+                        status, _ = direct_imap_select(mail, select_param)
+                        if status != "OK":
+                            raise RuntimeError(f"메일함 {repr(select_param)} 선택 실패 (상태: {status})")
+                        selected = True
 
                     otp_code = self._scan_for_otp(mail, sender_filter, code_pattern, start_time)
                     if otp_code:
@@ -343,9 +357,10 @@ class MailChecker:
                     except Exception:
                         pass
                     mail = None
+                    selected = False
 
-                # 3초 대기 후 같은 연결로 다시 스캔
-                time.sleep(3)
+                # 1.5초 대기 후 같은 연결로 다시 스캔 (SELECT된 메일함이라 SEARCH만 반복)
+                time.sleep(1.5)
                 elapsed = (datetime.datetime.now(datetime.timezone.utc) - start_time).total_seconds()
         finally:
             if mail is not None:

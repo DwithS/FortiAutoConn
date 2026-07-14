@@ -222,11 +222,11 @@ class VPNConnector:
                             # 중복 무한 재시도를 방지하기 위해 새로운 해시 감지 시에만 자동 갱신 및 재접속 구동
                             if detected_hash != self.trusted_cert:
                                 logger.info(f"[VPNConnector] 🛡️ 신뢰되지 않는 사내 게이트웨이 인증서 해시 자동 검출: {detected_hash}")
-                                logger.info("[VPNConnector] 해당 인증서를 화이트리스트에 임시 자동 추가하여 3초 후 안전 재접속을 구동합니다...")
+                                logger.info("[VPNConnector] 해당 인증서를 화이트리스트에 임시 자동 추가하여 1초 후 안전 재접속을 구동합니다...")
                                 self.trusted_cert = detected_hash
                                 self.process.close()
                                 # 대기 중 사용자가 Disconnect(stop)를 누르면 재시도 없이 즉시 중단
-                                if self._stop_event.wait(3):
+                                if self._stop_event.wait(1):
                                     return
                                 # 새로운 스레드로 무중단 자가 복구 연결 수행
                                 threading.Thread(target=self._run_vpn, daemon=True).start()
