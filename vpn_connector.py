@@ -18,6 +18,13 @@ class VPNConnector:
     REASON_VPN_AUTH = "vpn_auth"     # VPN 비밀번호 거부
     REASON_SUDO = "sudo"             # sudoers NOPASSWD 미설정 (setup.sh 재실행 필요)
     REASON_OTP = "otp"               # OTP 반복 거부
+    REASON_OTP_TIMEOUT = "otp_timeout"  # 인증 메일이 제한 시간 내 미도착 (메일 지연)
+
+    # OTP 인증 메일 대기 한도(초). 이 시간보다 메일이 느리게 오면 한 시도가 자기 인증메일을
+    # 받지 못하고 타임아웃 → 재시도 → 새 인증메일 발송이 반복되는 악순환에 빠지므로,
+    # 실제 메일 지연을 넉넉히 덮도록 한 번의 대기를 길게 잡습니다. (FortiToken 메일 코드
+    # 유효시간 내로 유지) 그래도 미도착이면 REASON_OTP_TIMEOUT으로 재시도를 중단합니다.
+    OTP_WAIT_SECONDS = 180
 
     def __init__(self, host, port, username, password, mail_checker, on_status_change=None, dns_bypass=False, split_tunnel=False, split_routes=""):
         self.host = host
@@ -175,16 +182,23 @@ class VPNConnector:
                         return
                     logger.info("[VPNConnector] 2차 OTP 코드 요구 프롬프트 감지. 인증 메일 확인 중...")
                     # 1차 비밀번호 제출 후 다음/카카오 이메일로 발송된 최신 메일 OTP 조회
-                    otp_code = self.mail_checker.fetch_latest_otp(max_wait_seconds=90)
+                    otp_code = self.mail_checker.fetch_latest_otp(max_wait_seconds=self.OTP_WAIT_SECONDS)
                     if otp_code:
                         # 로그 파일이 평문으로 보관되므로 코드는 첫 자리만 남기고 마스킹
                         masked = otp_code[:1] + "*" * (len(otp_code) - 1)
                         logger.info(f"[VPNConnector] 메일에서 파싱된 OTP 적용 입력: {masked}")
                         self.process.sendline(otp_code)
                     else:
-                        # 메일 로그인 거부가 원인이면 재시도해도 해결되지 않으므로 원인 코드를 전달
-                        reason = self.REASON_MAIL_AUTH if getattr(self.mail_checker, "auth_failed", False) else None
-                        logger.warning("[VPNConnector] 메일 수신 실패 또는 OTP 파싱 타임아웃. VPN 연결을 취소합니다.")
+                        # 원인 분기:
+                        # - 메일 로그인 거부(auth_failed): 비밀번호 문제 → REASON_MAIL_AUTH
+                        # - 그 외(로그인은 됐으나 제한 시간 내 메일 미도착): 메일 지연 → REASON_OTP_TIMEOUT
+                        #   이때 자동 재시도하면 VPN 비밀번호를 다시 제출해 새 인증메일이 또 발송되고,
+                        #   이미 느린 메일함을 더 붐비게 만드는 악순환이 되므로 재시도하지 않는 사유로 분류합니다.
+                        if getattr(self.mail_checker, "auth_failed", False):
+                            reason = self.REASON_MAIL_AUTH
+                        else:
+                            reason = self.REASON_OTP_TIMEOUT
+                        logger.warning(f"[VPNConnector] 메일 수신 실패 또는 OTP 파싱 타임아웃(사유: {reason}). VPN 연결을 취소합니다.")
                         self._fail(reason)
                         return
 

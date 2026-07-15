@@ -788,6 +788,7 @@ class FortiAutoConnApp(rumps.App):
                 VPNConnector.REASON_VPN_AUTH: "VPN 비밀번호가 거부되었습니다. Settings에서 VPN 비밀번호를 확인해 주세요.",
                 VPNConnector.REASON_SUDO: "관리자 무암호 권한이 설정되어 있지 않습니다. 터미널에서 ./setup.sh 를 다시 실행해 주세요.",
                 VPNConnector.REASON_OTP: "OTP 코드가 반복 거부되었습니다. 메일함 폴더 설정과 인증 메일 수신 여부를 확인해 주세요.",
+                VPNConnector.REASON_OTP_TIMEOUT: "인증 메일이 제한 시간 내에 도착하지 않았습니다. 메일 수신이 지연되는 상태일 수 있으니, 인증 메일이 도착한 것을 확인한 뒤 다시 연결해 주세요. (자동 재시도는 인증 메일 남발을 막기 위해 중단됩니다.)",
             }
 
             if reason in fatal_messages:
