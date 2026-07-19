@@ -94,10 +94,23 @@ _consumed_message_ids = set()
 OTP_CODE_PATTERN = re.compile(r"(?:AuthCode:\s*|Your authentication token code is\s*)(\d{6})", re.IGNORECASE)
 
 class MailChecker:
-    # 계정 접근제한(과다 로그인 차단) 방지: 한 번의 OTP 감시 동안 허용되는 최대 IMAP 로그인 횟수
-    # (소켓 타임아웃을 8초로 낮춰 좀비 커넥션을 빨리 포기하는 대신, 재접속 여유를 5회로 늘려
-    #  메일 도착 전에 한도가 소진돼 감시를 포기하는 일이 없게 균형을 맞춥니다. 90초/5회는 잠금 안전 범위.)
-    MAX_LOGIN_ATTEMPTS = 5
+    # 한 번의 OTP 감시 동안 허용되는 최대 IMAP 로그인 횟수 = 최대 폴링 횟수.
+    # 예전에는 로그인 1회를 재사용하며 폴링했으나, 재사용 세션의 SELECT가 항상 소켓 타임아웃(8초)에
+    # 걸려 OTP 1분 수명을 통째로 잡아먹는 문제가 확인되어(로그 분석), 폴링마다 새 연결로 로그인하도록
+    # 되돌렸습니다. 대신 폴링 간격을 넓히고(POLL_INTERVAL_SECONDS) 이 횟수를 보수적으로 제한해
+    # 계정 접근제한(과다 로그인 차단)을 피합니다. (OTP_TIMEOUT은 재시도 금지 사유라 폭주하지 않음)
+    MAX_LOGIN_ATTEMPTS = 15
+
+    # 메일 확인(폴링) 간격(초). 매 폴링마다 새 연결로 [로그인 → SELECT → SEARCH]를 수행합니다.
+    POLL_INTERVAL_SECONDS = 4
+
+    # FortiToken 인증 메일에 담긴 OTP 코드의 유효 수명(초). 발송 시점부터 이 시간이 지나면
+    # 코드를 제출해도 게이트웨이가 무조건 거부합니다.
+    OTP_VALIDITY_SECONDS = 60
+    # OTP 제출 왕복(소켓 전송 + 게이트웨이 처리) 여유(초). '지금-메일발송시각'으로 계산한 코드 나이가
+    # (유효 수명 - 이 여유)를 넘으면, 제출해도 만료로 실패할 가능성이 높으므로 사용하지 않고 더 최신
+    # 메일을 기다립니다. (거의 만료된 코드 제출 → 실패 → 재시도 → 인증메일 남발의 악순환 차단)
+    OTP_SUBMIT_MARGIN_SECONDS = 10
 
     # 인증(OTP) 메일 발신자 기본값. Settings에서 otp_sender로 변경 가능합니다.
     DEFAULT_OTP_SENDER = "it@daily-funding.com"
@@ -118,6 +131,11 @@ class MailChecker:
 
         # 한글 폴더명(비ASCII) 지원을 위해 IMAP Modified UTF-7 형식으로 자동 인코딩
         self.mailbox = encode_imap_utf7(cleaned_mailbox)
+
+        # 서버의 실제 폴더 바이트명 캐시. list()로 1회만 해석하고 이후 폴링은 재사용합니다.
+        # (폴링마다 새로 로그인하므로, list()까지 매번 반복하면 왕복이 늘고 SELECT 직전 상태를
+        #  흔들 수 있어 최초 1회만 해석합니다.)
+        self._resolved_folder = None
 
     def _connect_and_login(self):
         """
@@ -210,7 +228,15 @@ class MailChecker:
         return self.mailbox
 
     def _scan_for_otp(self, mail, sender_filter, code_pattern, start_time):
-        """선택된 메일함에서 신규 OTP 메일을 1회 스캔합니다. (연결/로그인 없음)"""
+        """선택된 메일함에서 신규 OTP 메일을 1회 스캔합니다. (연결/로그인 없음)
+
+        OTP 코드는 발송 시점부터 OTP_VALIDITY_SECONDS(1분)만 유효하므로, '지금' 기준으로 계산한
+        코드 나이가 유효 여유를 넘는 메일은 제출해도 실패하니 사용하지 않고 더 최신 메일을 기다립니다.
+        """
+        # 코드 나이 판정 기준 시각. 스캔 시작 시점으로 고정해 FETCH 왕복 동안의 오차를 줄입니다.
+        now = datetime.datetime.now(datetime.timezone.utc)
+        # 이 나이를 넘긴 코드는 제출해도 만료로 실패할 가능성이 높아 사용하지 않습니다.
+        max_usable_age = self.OTP_VALIDITY_SECONDS - self.OTP_SUBMIT_MARGIN_SECONDS
         # 진단: SEARCH 왕복 시간을 측정합니다. 좀비 커넥션이면 여기서 소켓 타임아웃까지
         # 블록되므로, 이 값이 8초에 근접하면 커넥션이 죽은 것으로 판단할 수 있습니다.
         t0 = time.monotonic()
@@ -243,11 +269,18 @@ class MailChecker:
             else:
                 mail_time = mail_time.astimezone(datetime.timezone.utc)
 
-            # 감시 시작 60초 이전의 오래된 메일은 이미 만료된 OTP일 수 있으므로 절대 사용하지 않음
+            # OTP 코드의 '현재 나이'로 유효성 판정. 발송된 지 오래된 메일(이전 시도의 만료 코드나
+            # 전송 지연으로 늦게 도착한 코드)은 제출해도 게이트웨이가 거부하므로 사용하지 않습니다.
             # (만료 OTP 제출 → 실패 → 재시도 → 인증 메일 남발로 이어지는 악순환 방지)
-            time_diff = (start_time - mail_time).total_seconds()
-            if time_diff > 60:
-                # 역순이므로 이 시점부터 과거 메일은 탐색 중단
+            code_age = (now - mail_time).total_seconds()
+            if code_age > max_usable_age:
+                # 최신순 탐색이므로 이 메일이 이미 만료(임박)면 더 과거 메일은 볼 필요 없이 중단.
+                # 아직 이번 감시 시간이 남아 있다면 다음 폴링에서 더 최신 메일을 계속 기다립니다.
+                logger.info(
+                    f"[MailChecker] OTP 메일을 찾았으나 코드 나이({code_age:.0f}s)가 유효 한계"
+                    f"({max_usable_age:.0f}s, 수명 {self.OTP_VALIDITY_SECONDS}s)를 넘어 사용하지 않고 "
+                    f"더 최신 인증 메일을 기다립니다."
+                )
                 break
 
             # 이전 연결 시도에서 이미 사용한 OTP 메일은 건너뜀 (일회용 코드 재사용 금지)
@@ -293,98 +326,79 @@ class MailChecker:
 
         return None
 
-    def fetch_latest_otp(self, sender_filter=None, max_wait_seconds=90):
+    def fetch_latest_otp(self, sender_filter=None, max_wait_seconds=75):
         """
         메일함에서 최신 OTP 번호를 감시하여 반환합니다.
         sender_filter를 생략하면 설정된 otp_sender(기본 DEFAULT_OTP_SENDER)를 사용합니다.
 
-        계정 접근제한(과다 로그인 차단) 방지 설계:
-        - IMAP 로그인은 1회만 수행하고 같은 연결을 재사용하며 1.5초마다 재검색만 합니다.
-          (기존에는 3초마다 새로 로그인해 감시 1회당 ~30회의 로그인이 발생, 접근제한의 원인)
-        - 폴더 SELECT도 커넥션당 1회만 수행하고, 이후 폴링은 SEARCH만 반복합니다.
-          (SELECT은 IMAP 왕복이 무거워 폴링마다 반복하면 지연이 커지고, 이번처럼 SELECT 응답
-           대기 중 좀비 커넥션에 걸릴 확률도 높아집니다. SELECT된 메일함에 도착한 신규 메일은
-           재-SELECT 없이도 SEARCH가 다시 평가해 잡아냅니다.)
+        설계 (매 폴링마다 새로 로그인):
+        - 예전에는 로그인 1회를 재사용하며 폴링했으나, 재사용 세션의 SELECT가 사실상 매번 소켓
+          타임아웃(8초)에 걸려(로그로 확인됨) OTP의 1분 수명을 통째로 소진했습니다. 그래서 폴링마다
+          [새 연결 → 로그인 → SELECT → SEARCH → 로그아웃]을 수행하도록 되돌렸습니다.
+        - 대신 계정 접근제한(과다 로그인 차단)을 피하려고 폴링 간격을 넓히고(POLL_INTERVAL_SECONDS)
+          전체 로그인 횟수를 MAX_LOGIN_ATTEMPTS로 제한합니다. (OTP 미도착은 REASON_OTP_TIMEOUT으로
+          상위에서 재시도가 금지되므로 로그인이 연쇄 폭주하지 않습니다.)
+        - 폴더 해석(list())은 최초 1회만 하고 서버 폴더 바이트를 캐시해 이후엔 SELECT만 반복합니다.
+        - 코드 수명(1분)을 넘긴 메일은 _scan_for_otp가 제출 대상에서 제외합니다(만료 코드 제출 방지).
         - 서버가 로그인을 거부하면(비밀번호 오류) 즉시 중단하고 auth_failed=True를 세웁니다.
-        - 네트워크 장애로 인한 재접속도 최대 MAX_LOGIN_ATTEMPTS회로 제한합니다.
         """
         sender_filter = sender_filter or self.otp_sender
-        logger.info(f"[MailChecker] {sender_filter} 로부터의 OTP 메일 감시 시작 (최대 {max_wait_seconds}초 대기)...")
+        logger.info(f"[MailChecker] {sender_filter} 로부터의 OTP 메일 감시 시작 "
+                    f"(최대 {max_wait_seconds}초, 폴링마다 재로그인, 최대 {self.MAX_LOGIN_ATTEMPTS}회)...")
 
         self.auth_failed = False
         start_time = datetime.datetime.now(datetime.timezone.utc)
         elapsed = 0
-
         code_pattern = OTP_CODE_PATTERN
-
-        mail = None
-        select_param = None
         login_attempts = 0
-        # 폴더 SELECT는 커넥션당 1회만 수행하기 위한 플래그. 재접속하면 다시 False로 돌아갑니다.
-        selected = False
 
-        try:
-            while elapsed < max_wait_seconds:
-                # 1) 연결 확보: 연결이 없거나 끊어졌을 때만 로그인 (연결 재사용이 핵심)
-                if mail is None:
-                    if login_attempts >= self.MAX_LOGIN_ATTEMPTS:
-                        logger.error(f"[MailChecker] IMAP 접속 재시도 한도({self.MAX_LOGIN_ATTEMPTS}회) 초과. 계정 보호를 위해 감시를 중단합니다.")
-                        return None
-                    login_attempts += 1
-                    try:
-                        t0 = time.monotonic()
-                        mail = self._connect_and_login()
-                        select_param = self._resolve_target_folder(mail)
-                        selected = False
-                        logger.debug(f"[MailChecker] 접속+로그인+폴더해석 완료: {(time.monotonic() - t0) * 1000:.0f}ms "
-                                     f"(시도 {login_attempts}/{self.MAX_LOGIN_ATTEMPTS})")
-                    except imaplib.IMAP4.error as e:
-                        logger.error(f"[MailChecker] 메일 로그인 거부: {e}. 계정 접근제한 방지를 위해 재시도하지 않습니다.")
-                        return None
-                    except Exception as e:
-                        logger.warning(f"[MailChecker] IMAP 접속 실패 ({login_attempts}/{self.MAX_LOGIN_ATTEMPTS}): {e}")
-                        mail = None
-                        time.sleep(5)
-                        elapsed = (datetime.datetime.now(datetime.timezone.utc) - start_time).total_seconds()
-                        continue
+        while elapsed < max_wait_seconds:
+            if login_attempts >= self.MAX_LOGIN_ATTEMPTS:
+                logger.error(f"[MailChecker] IMAP 로그인 한도({self.MAX_LOGIN_ATTEMPTS}회) 초과. "
+                             f"계정 보호를 위해 감시를 중단합니다.")
+                return None
+            login_attempts += 1
 
-                # 2) 폴더 선택은 커넥션당 1회만, 이후 폴링은 SEARCH만 반복 (추가 로그인/SELECT 없음)
-                logger.debug(f"[MailChecker] 폴링 스캔 시작 (경과 {elapsed:.1f}s, selected={selected})")
-                # 진단: 이 try 블록에서 소요/블록된 시간을 측정합니다. 예외 발생 시 이 값이
-                # 소켓 타임아웃(8초)에 근접하면 좀비(half-open) 커넥션이 원인임을 확증할 수 있습니다.
-                op_start = time.monotonic()
-                try:
-                    if not selected:
-                        t0 = time.monotonic()
-                        status, _ = direct_imap_select(mail, select_param)
-                        logger.debug(f"[MailChecker] SELECT 완료: {(time.monotonic() - t0) * 1000:.0f}ms (status={status})")
-                        if status != "OK":
-                            raise RuntimeError(f"메일함 {repr(select_param)} 선택 실패 (상태: {status})")
-                        selected = True
+            mail = None
+            op_start = time.monotonic()
+            try:
+                # 이번 폴링용 새 연결 + 로그인
+                mail = self._connect_and_login()
 
-                    otp_code = self._scan_for_otp(mail, sender_filter, code_pattern, start_time)
-                    if otp_code:
-                        return otp_code
-                except Exception as e:
-                    blocked_ms = (time.monotonic() - op_start) * 1000
-                    logger.warning(f"[MailChecker] 메일 확인 중 연결 오류 감지, 재접속을 준비합니다 "
-                                   f"(블록 {blocked_ms:.0f}ms): {e}")
+                # 폴더 바이트는 최초 1회만 list()로 해석하고 이후 캐시 재사용
+                if self._resolved_folder is None:
+                    self._resolved_folder = self._resolve_target_folder(mail)
+                select_param = self._resolved_folder
+
+                status, _ = direct_imap_select(mail, select_param)
+                if status != "OK":
+                    raise RuntimeError(f"메일함 {repr(select_param)} 선택 실패 (상태: {status})")
+
+                otp_code = self._scan_for_otp(mail, sender_filter, code_pattern, start_time)
+                logger.debug(f"[MailChecker] 폴링 완료: {(time.monotonic() - op_start) * 1000:.0f}ms "
+                             f"(경과 {elapsed:.1f}s, 시도 {login_attempts}/{self.MAX_LOGIN_ATTEMPTS})")
+                if otp_code:
+                    return otp_code
+            except imaplib.IMAP4.error as e:
+                # 서버의 명시적 로그인 거부(비밀번호 오류 등)는 재시도해도 성공할 수 없고, 반복하면
+                # 계정이 잠기므로 즉시 중단합니다. (_connect_and_login이 auth_failed를 이미 세팅)
+                logger.error(f"[MailChecker] 메일 로그인 거부: {e}. 계정 접근제한 방지를 위해 재시도하지 않습니다.")
+                return None
+            except Exception as e:
+                # 네트워크/좀비 커넥션 등 일시 오류는 이번 폴링만 버리고 다음 폴링에서 새로 로그인.
+                blocked_ms = (time.monotonic() - op_start) * 1000
+                logger.warning(f"[MailChecker] 이번 폴링 실패, 다음 폴링에서 재접속합니다 "
+                               f"(블록 {blocked_ms:.0f}ms, 시도 {login_attempts}/{self.MAX_LOGIN_ATTEMPTS}): {e}")
+            finally:
+                if mail is not None:
                     try:
                         mail.logout()
                     except Exception:
                         pass
-                    mail = None
-                    selected = False
 
-                # 1.5초 대기 후 같은 연결로 다시 스캔 (SELECT된 메일함이라 SEARCH만 반복)
-                time.sleep(1.5)
-                elapsed = (datetime.datetime.now(datetime.timezone.utc) - start_time).total_seconds()
-        finally:
-            if mail is not None:
-                try:
-                    mail.logout()
-                except Exception:
-                    pass
+            # 폴링 간격 대기 후 새 연결로 다시 스캔
+            time.sleep(self.POLL_INTERVAL_SECONDS)
+            elapsed = (datetime.datetime.now(datetime.timezone.utc) - start_time).total_seconds()
 
         logger.warning("[MailChecker] OTP 수신 대기 시간이 초과되었습니다.")
         return None
