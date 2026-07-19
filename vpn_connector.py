@@ -26,6 +26,15 @@ class VPNConnector:
     # 유효시간 내로 유지) 그래도 미도착이면 REASON_OTP_TIMEOUT으로 재시도를 중단합니다.
     OTP_WAIT_SECONDS = 180
 
+    # 연결 수명 감시(health check) 설정.
+    # 5초마다 ppp 인터페이스 상태를 확인하되, 순간적인 링크 흔들림(WiFi blip, pppd LCP
+    # 재협상 등)을 실제 세션 유실로 오판하지 않도록 '연속' 실패 임계치를 둡니다. 한 번의
+    # 실패로 즉시 전체 재접속(→ OTP 메일 재수신)에 들어가면, 순간 blip이 '수 분마다 끊김 +
+    # 인증메일 폭탄'으로 증폭되는 악순환이 생기기 때문입니다. (정품 FortiClient은 keepalive로
+    # 이런 blip을 흡수하지만 openfortivpn엔 자동 재접속이 없어 우리가 완충해 줘야 합니다.)
+    HEALTHCHECK_INTERVAL_SECONDS = 5
+    HEALTHCHECK_FAILURE_THRESHOLD = 3  # 연속 3회(≈15초) 실패해야 세션 유실로 확정
+
     def __init__(self, host, port, username, password, mail_checker, on_status_change=None, dns_bypass=False, split_tunnel=False, split_routes=""):
         self.host = host
         self.port = port
@@ -265,21 +274,39 @@ class VPNConnector:
             # 자식을 회수(reap)하지 못한 채(좀비) 계속 살아있을 수 있습니다. 이 경우 isalive()만 보면
             # 터널이 실제로는 끊겼는데도 영원히 '연결됨(🟢)'으로 오판하게 됩니다.
             # → 자식 프로세스 생존 여부와 별개로, 실제 ppp 인터페이스가 UP/RUNNING 상태인지도 함께 확인합니다.
+            consecutive_failures = 0
             while not self._stop_event.is_set():
                 process_alive = self.process.isalive()
-                tunnel_up = self._is_ppp_interface_up(self._active_ppp_if)
+                tunnel_up, probe_detail = self._probe_ppp_interface(self._active_ppp_if)
 
-                if not process_alive or not tunnel_up:
+                if process_alive and tunnel_up:
+                    # 정상 폴링: 이전에 쌓인 순간 실패 카운트를 리셋(blip 흡수)
+                    if consecutive_failures:
+                        logger.info(
+                            f"[VPNConnector] ppp 인터페이스({self._active_ppp_if}) 상태가 회복되어 "
+                            f"세션 유실 판정을 취소합니다 (직전 연속 실패 {consecutive_failures}회)."
+                        )
+                    consecutive_failures = 0
+                else:
+                    # 실패 폴링: 즉시 끊지 않고 연속 실패를 누적. 순간 blip이면 다음 폴링에서 회복됨.
+                    consecutive_failures += 1
                     logger.warning(
-                        f"[VPNConnector] VPN 터널 세션이 유실되었습니다 "
-                        f"(프로세스 생존: {process_alive}, ppp 인터페이스({self._active_ppp_if}) 정상: {tunnel_up})."
+                        f"[VPNConnector] 연결 수명 감시 실패 감지 "
+                        f"({consecutive_failures}/{self.HEALTHCHECK_FAILURE_THRESHOLD}회 연속) — "
+                        f"프로세스 생존: {process_alive}, ppp 인터페이스({self._active_ppp_if}): {probe_detail}"
                     )
-                    self.set_status(self.STATUS_DISCONNECTED)
-                    break
+                    if consecutive_failures >= self.HEALTHCHECK_FAILURE_THRESHOLD:
+                        logger.warning(
+                            f"[VPNConnector] VPN 터널 세션이 유실되었습니다 "
+                            f"(연속 {consecutive_failures}회 실패, 프로세스 생존: {process_alive}, "
+                            f"ppp 인터페이스({self._active_ppp_if}): {probe_detail})."
+                        )
+                        self.set_status(self.STATUS_DISCONNECTED)
+                        break
 
-                # 5초 간격으로 연결 활성화 지속 모니터링
+                # 일정 간격으로 연결 활성화 지속 모니터링
                 # (stop() 요청 시 즉시 깨어나도록 sleep 대신 이벤트 대기 사용)
-                self._stop_event.wait(5)
+                self._stop_event.wait(self.HEALTHCHECK_INTERVAL_SECONDS)
 
         except Exception as e:
             logger.error(f"[VPNConnector] VPN 구동 스레드 내부 오류: {e}")
@@ -307,25 +334,34 @@ class VPNConnector:
                 return "ppp0"  # 기본값 백업
             time.sleep(0.5)
 
-    def _is_ppp_interface_up(self, ifname):
+    def _probe_ppp_interface(self, ifname):
         """
-        지정된 ppp 인터페이스가 여전히 UP/RUNNING 상태인지 확인합니다.
+        지정된 ppp 인터페이스가 여전히 UP/RUNNING 상태인지 확인하고 (정상여부, 사유) 를 돌려줍니다.
         openfortivpn/pppd 자식 프로세스가 죽으면 이 인터페이스도 함께 사라지므로,
         pexpect가 감시하는 'sudo' 래퍼 프로세스의 생존 여부만으로는 잡아낼 수 없는
         '자식만 죽고 부모(sudo)는 좀비 상태로 살아있는' 상황을 탐지하는 용도입니다.
+
+        반환하는 사유 문자열은 세션 유실의 진짜 원인(인터페이스 소멸 vs 플래그 순간 변화 vs
+        진단 명령 오류)을 로그로 구분하기 위한 것입니다. 이걸로 '실제 링크가 죽는지' vs
+        '헬스체크가 순간 헛디디는지'를 사후에 판별할 수 있습니다.
         """
         if not ifname:
-            return False
+            return False, "인터페이스명 미확정(None)"
         try:
             res = subprocess.check_output(["ifconfig", ifname], encoding="utf-8", stderr=subprocess.DEVNULL)
-            return bool(re.search(r"flags=.*<UP,POINTOPOINT,RUNNING", res))
+            flags_match = re.search(r"flags=\S*<([^>]*)>", res)
+            flags = flags_match.group(1) if flags_match else "flags 파싱 실패"
+            if re.search(r"flags=.*<UP,POINTOPOINT,RUNNING", res):
+                return True, f"정상(flags={flags})"
+            # 인터페이스는 존재하나 UP/POINTOPOINT/RUNNING 조합이 아님 → 순간 플래그 변화 가능성
+            return False, f"인터페이스 존재하나 RUNNING 아님(flags={flags})"
         except subprocess.CalledProcessError:
-            # 인터페이스 자체가 더 이상 존재하지 않음 (터널 소멸)
-            return False
+            # ifconfig가 비정상 종료 → 인터페이스 자체가 더 이상 존재하지 않음 (터널 소멸)
+            return False, "인터페이스 소멸(ifconfig 조회 실패)"
         except Exception as e:
             logger.error(f"[VPNConnector] ppp 인터페이스({ifname}) 상태 확인 중 에러: {e}")
             # 확인 자체가 실패한 경우는 네트워크 명령어 문제일 수 있으므로 오탐(불필요한 재연결)을 피하기 위해 생존으로 간주
-            return True
+            return True, f"진단 명령 오류로 생존 간주({e})"
 
     def _apply_split_routing(self, ppp_if=None):
         if not self.split_routes:
