@@ -104,6 +104,20 @@ class MailChecker:
     # 메일 확인(폴링) 간격(초). 매 폴링마다 새 연결로 [로그인 → SELECT → SEARCH]를 수행합니다.
     POLL_INTERVAL_SECONDS = 4
 
+    # 소켓 타임아웃(초)을 단계별로 분리합니다.
+    # - CONNECT: TCP/TLS 핸드셰이크 + 로그인. 죽은(half-open) 연결을 오래 붙잡지 않도록 짧게.
+    # - DATA: SELECT/SEARCH/FETCH. 다음/카카오 IMAP은 새 연결의 첫 SELECT/SEARCH 응답이
+    #   8초를 넘길 때가 많은데(로그상 스톨이 항상 8초 천장에 붙음 = 우리가 응답을 끊는 중),
+    #   이를 8초에서 끊고 재시도하면 폴링 3회(≈24초)를 낭비해 OTP 1분 수명을 깎아먹습니다.
+    #   → 데이터 명령은 넉넉히 줘서 느린 서버 응답이 첫 폴링에 완료되게 합니다(폴링마다 새로
+    #   로그인하므로 좀비 연결에 걸려도 그 1회 폴링만 손해입니다).
+    CONNECT_TIMEOUT_SECONDS = 8
+    DATA_TIMEOUT_SECONDS = 20
+
+    # 이 시간(ms)을 넘긴 SELECT/SEARCH는 '서버 지연'으로 눈에 띄게 로그를 남겨, 어떤 명령이
+    # 느린지 평상시 로그(디버그 비활성 상태)에서도 바로 진단할 수 있게 합니다.
+    SLOW_OP_WARN_MS = 3000
+
     # FortiToken 인증 메일에 담긴 OTP 코드의 유효 수명(초). 발송 시점부터 이 시간이 지나면
     # 코드를 제출해도 게이트웨이가 무조건 거부합니다.
     OTP_VALIDITY_SECONDS = 60
@@ -143,10 +157,8 @@ class MailChecker:
         네트워크 장애가 아닌 '서버의 명시적 로그인 거부'는 재시도해도 절대 성공할 수 없고,
         반복하면 메일 계정이 접근제한에 걸리므로 auth_failed 플래그를 세우고 즉시 예외를 전파합니다.
         """
-        # 좀비(half-open) 커넥션을 오래 붙잡지 않도록 소켓 타임아웃을 짧게 둡니다.
-        # 원격 IMAP 프런트가 유휴 커넥션을 조용히 폐기하면 응답이 영영 오지 않는데,
-        # 이 시간이 곧 '죽은 커넥션을 감지해 재접속하기까지의 낭비 시간'이 됩니다.
-        mail = imaplib.IMAP4_SSL(self.host, self.port, timeout=8)
+        # 연결/로그인 단계는 짧은 타임아웃(CONNECT)으로 죽은 커넥션을 빨리 포기합니다.
+        mail = imaplib.IMAP4_SSL(self.host, self.port, timeout=self.CONNECT_TIMEOUT_SECONDS)
         try:
             mail.login(self.username, self.password)
         except imaplib.IMAP4.error:
@@ -156,6 +168,12 @@ class MailChecker:
             except Exception:
                 pass
             raise
+        # 로그인 성공 후에는 데이터 명령(SELECT/SEARCH/FETCH)용으로 타임아웃을 넉넉히 넓힙니다.
+        # (느린 서버가 8초를 넘겨 응답하려는 걸 잘라내 헛되이 재시도하는 문제 방지)
+        try:
+            mail.sock.settimeout(self.DATA_TIMEOUT_SECONDS)
+        except Exception:
+            pass
         return mail
 
     def verify_login(self):
@@ -243,7 +261,11 @@ class MailChecker:
         status, messages = mail.search(None, f'FROM "{sender_filter}"')
         search_ms = (time.monotonic() - t0) * 1000
         matched = len(messages[0].split()) if (status == "OK" and messages and messages[0]) else 0
-        logger.debug(f"[MailChecker] SEARCH 완료: {search_ms:.0f}ms, 매칭 {matched}건 (status={status})")
+        # 느린 SEARCH는 평상시 로그에서도 보이도록 승격 (SELECT vs SEARCH 지연 원인 구분용)
+        if search_ms > self.SLOW_OP_WARN_MS:
+            logger.warning(f"[MailChecker] SEARCH 응답이 느립니다: {search_ms:.0f}ms, 매칭 {matched}건 (status={status})")
+        else:
+            logger.debug(f"[MailChecker] SEARCH 완료: {search_ms:.0f}ms, 매칭 {matched}건 (status={status})")
         if status != "OK" or not messages[0]:
             return None
 
@@ -370,7 +392,12 @@ class MailChecker:
                     self._resolved_folder = self._resolve_target_folder(mail)
                 select_param = self._resolved_folder
 
+                sel_t0 = time.monotonic()
                 status, _ = direct_imap_select(mail, select_param)
+                select_ms = (time.monotonic() - sel_t0) * 1000
+                # 느린 SELECT는 평상시 로그에서도 보이도록 승격 (SELECT vs SEARCH 지연 원인 구분용)
+                if select_ms > self.SLOW_OP_WARN_MS:
+                    logger.warning(f"[MailChecker] SELECT 응답이 느립니다: {select_ms:.0f}ms (status={status})")
                 if status != "OK":
                     raise RuntimeError(f"메일함 {repr(select_param)} 선택 실패 (상태: {status})")
 
