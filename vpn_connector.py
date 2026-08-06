@@ -4,6 +4,7 @@ import time
 import re
 import subprocess
 import ipaddress
+from collections import deque
 from logger import logger
 
 class VPNConnector:
@@ -73,6 +74,11 @@ class VPNConnector:
         self.failure_reason = None
         self._active_ppp_if = None  # 연결 성공 시 확인된 실제 ppp 인터페이스명 (수명 감시에 재사용)
         self._mail_verified = False  # 메일 로그인 사전 점검 통과 여부 (자가 복구 재시도 시 중복 점검 방지)
+        # 🔎 'Tunnel is up' 이후에는 expect 루프가 더 이상 프로세스 출력을 읽지 않아,
+        # 세션 도중 pppd/openfortivpn이 왜 죽는지(LCP 실패, 게이트웨이 강제 종료 메시지 등)가
+        # 로그에 전혀 남지 않던 진단 공백이 있었습니다. 수명 감시 루프에서 논블로킹으로
+        # 계속 배수해 최근 출력을 여기 쌓아두고, 세션 유실 판정 시 함께 로그로 남깁니다.
+        self._output_tail = deque(maxlen=100)
 
     def set_status(self, new_status):
         # 동일 상태 재통지 차단: 이미 DISCONNECTED로 통지된 커넥터를 정리 목적으로 stop()해도
@@ -289,6 +295,7 @@ class VPNConnector:
             # → 자식 프로세스 생존 여부와 별개로, 실제 ppp 인터페이스가 UP/RUNNING 상태인지도 함께 확인합니다.
             consecutive_failures = 0
             while not self._stop_event.is_set():
+                self._drain_process_output()
                 process_alive = self.process.isalive()
                 tunnel_up, probe_detail = self._probe_ppp_interface(self._active_ppp_if)
 
@@ -309,10 +316,13 @@ class VPNConnector:
                         f"프로세스 생존: {process_alive}, ppp 인터페이스({self._active_ppp_if}): {probe_detail}"
                     )
                     if consecutive_failures >= self.HEALTHCHECK_FAILURE_THRESHOLD:
+                        self._drain_process_output()  # 판정 직전 마지막 출력까지 한 번 더 배수
+                        tail_log = "\n".join(self._output_tail) if self._output_tail else "(캡처된 출력 없음 — 조용히 종료됨)"
                         logger.warning(
                             f"[VPNConnector] VPN 터널 세션이 유실되었습니다 "
                             f"(연속 {consecutive_failures}회 실패, 프로세스 생존: {process_alive}, "
-                            f"ppp 인터페이스({self._active_ppp_if}): {probe_detail})."
+                            f"ppp 인터페이스({self._active_ppp_if}): {probe_detail}).\n"
+                            f"세션 종료 전후 openfortivpn/pppd 출력(최근 {len(self._output_tail)}줄):\n{tail_log}"
                         )
                         self.set_status(self.STATUS_DISCONNECTED)
                         break
@@ -324,6 +334,29 @@ class VPNConnector:
         except Exception as e:
             logger.error(f"[VPNConnector] VPN 구동 스레드 내부 오류: {e}")
             self._fail()
+
+    def _drain_process_output(self):
+        """'Tunnel is up' 이후 pexpect가 더 이상 읽지 않는 프로세스 출력을 논블로킹으로 배수해
+        self._output_tail에 최근 줄만 남깁니다. openfortivpn/pppd가 세션 도중 남기는 종료 사유
+        (LCP 재협상 실패, 게이트웨이의 연결 종료 메시지 등)를 세션 유실 판정 시 함께 로그로
+        남기기 위한 것으로, 정상 상태에서도 매 폴링마다 조용히 호출됩니다."""
+        if not self.process:
+            return
+        try:
+            while True:
+                chunk = self.process.read_nonblocking(size=4096, timeout=0)
+                if not chunk:
+                    break
+                for line in chunk.splitlines():
+                    line = line.strip()
+                    if line:
+                        self._output_tail.append(line)
+        except pexpect.TIMEOUT:
+            pass  # 새로 읽을 출력 없음 (정상)
+        except pexpect.EOF:
+            pass  # 프로세스 종료로 출력 스트림이 닫힘
+        except Exception as e:
+            logger.debug(f"[VPNConnector] 프로세스 출력 배수 중 에러(무시 가능): {e}")
 
     @staticmethod
     def list_active_ppp_interfaces():
