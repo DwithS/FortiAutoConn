@@ -36,6 +36,13 @@ class VPNConnector:
     HEALTHCHECK_INTERVAL_SECONDS = 5
     HEALTHCHECK_FAILURE_THRESHOLD = 3  # 연속 3회(≈15초) 실패해야 세션 유실로 확정
 
+    # 🔁 유휴(idle) 세션 방지용 킵얼라이브 간격.
+    # 진단 로그에서 확인된 실제 원인: FortiGate가 ppp 터널로 실제 트래픽이 일정 시간(관찰상
+    # 약 5분) 오가지 않으면 SSL 세션을 서버 쪽에서 끊어버립니다(pppd가 Hangup/SIGHUP으로
+    # 종료됨). openfortivpn 자체의 프로토콜 레벨 킵얼라이브는 이 '트래픽 기준' 유휴 판정을
+    # 막지 못하므로, 실제로 ppp 인터페이스를 통해 나가는 최소한의 패킷을 주기적으로 흘려보냅니다.
+    IDLE_KEEPALIVE_INTERVAL_SECONDS = 60
+
     def __init__(self, host, port, username, password, mail_checker, on_status_change=None, dns_bypass=False, split_tunnel=False, split_routes="", apply_routing_on_connect=True, exclude_interfaces=None):
         self.host = host
         self.port = port
@@ -294,6 +301,7 @@ class VPNConnector:
             # 터널이 실제로는 끊겼는데도 영원히 '연결됨(🟢)'으로 오판하게 됩니다.
             # → 자식 프로세스 생존 여부와 별개로, 실제 ppp 인터페이스가 UP/RUNNING 상태인지도 함께 확인합니다.
             consecutive_failures = 0
+            last_keepalive_at = 0
             while not self._stop_event.is_set():
                 self._drain_process_output()
                 process_alive = self.process.isalive()
@@ -307,6 +315,11 @@ class VPNConnector:
                             f"세션 유실 판정을 취소합니다 (직전 연속 실패 {consecutive_failures}회)."
                         )
                     consecutive_failures = 0
+
+                    now = time.time()
+                    if now - last_keepalive_at >= self.IDLE_KEEPALIVE_INTERVAL_SECONDS:
+                        self._send_idle_keepalive()
+                        last_keepalive_at = now
                 else:
                     # 실패 폴링: 즉시 끊지 않고 연속 실패를 누적. 순간 blip이면 다음 폴링에서 회복됨.
                     consecutive_failures += 1
@@ -357,6 +370,41 @@ class VPNConnector:
             pass  # 프로세스 종료로 출력 스트림이 닫힘
         except Exception as e:
             logger.debug(f"[VPNConnector] 프로세스 출력 배수 중 에러(무시 가능): {e}")
+
+    def _get_ppp_peer_ip(self, ifname):
+        """ppp 링크의 반대편(피어) IP를 돌려줍니다. 'inet <local> --> <peer> netmask ...'
+        형식에서 <peer>를 파싱합니다. 이 주소는 FortiGate 쪽 터널 종단점이라 언제나 존재하며
+        사내망의 특정 서버 생존 여부와 무관하게 유효합니다 — 유휴 방지 핑의 목적지로 쓰기에
+        가장 안전한 선택입니다."""
+        if not ifname:
+            return None
+        try:
+            res = subprocess.check_output(["ifconfig", ifname], encoding="utf-8", stderr=subprocess.DEVNULL)
+            m = re.search(r"inet\s+[\d.]+\s+-->\s+([\d.]+)", res)
+            return m.group(1) if m else None
+        except Exception as e:
+            logger.debug(f"[VPNConnector] ppp 피어 IP 확인 중 에러(무시 가능): {e}")
+            return None
+
+    def _send_idle_keepalive(self):
+        """FortiGate SSL-VPN이 ppp 터널의 트래픽 유무만으로 유휴를 판정해 세션을 끊는 것으로
+        진단 로그에서 확인되었으므로(연결 유지시간이 오간 바이트 수에 비례), 실제 트래픽이
+        없는 동안에도 최소한의 패킷이 터널을 통해 나가도록 주기적으로 1회 핑을 보냅니다.
+        목적지는 항상 ppp 링크 자신의 피어 주소로 고정합니다: 스플릿 라우팅 대역 밖의
+        주소로는 애초에 ppp0를 타지 않아 유휴 판정을 막지 못하고, 응답이 오는지도 중요하지
+        않습니다(패킷이 인터페이스를 통해 나가는 것 자체가 목적)."""
+        peer_ip = self._get_ppp_peer_ip(self._active_ppp_if)
+        if not peer_ip:
+            logger.debug("[VPNConnector] 킵얼라이브 대상(ppp 피어 IP)을 확인하지 못해 이번 주기는 건너뜁니다.")
+            return
+        try:
+            subprocess.Popen(
+                ["ping", "-c", "1", "-t", "2", peer_ip],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            logger.debug(f"[VPNConnector] 유휴 방지 킵얼라이브 핑 전송: {peer_ip} (인터페이스 {self._active_ppp_if})")
+        except Exception as e:
+            logger.debug(f"[VPNConnector] 킵얼라이브 핑 전송 실패(무시 가능): {e}")
 
     @staticmethod
     def list_active_ppp_interfaces():
