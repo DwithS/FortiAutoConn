@@ -35,7 +35,7 @@ class VPNConnector:
     HEALTHCHECK_INTERVAL_SECONDS = 5
     HEALTHCHECK_FAILURE_THRESHOLD = 3  # 연속 3회(≈15초) 실패해야 세션 유실로 확정
 
-    def __init__(self, host, port, username, password, mail_checker, on_status_change=None, dns_bypass=False, split_tunnel=False, split_routes=""):
+    def __init__(self, host, port, username, password, mail_checker, on_status_change=None, dns_bypass=False, split_tunnel=False, split_routes="", apply_routing_on_connect=True, exclude_interfaces=None):
         self.host = host
         self.port = port
         self.username = username
@@ -46,6 +46,17 @@ class VPNConnector:
         self.dns_bypass = dns_bypass
         self.split_tunnel = split_tunnel
         self.split_routes = split_routes
+
+        # 🔀 make-before-break(무중단 세션 갱신) 지원용 옵션.
+        # - apply_routing_on_connect=False: 연결 성공 시 스플릿 라우팅을 '아직' 붙이지 않습니다.
+        #   기존 터널을 유지한 채 새 터널만 먼저 띄워두고(트래픽은 기존 터널로 계속 흐름),
+        #   App 오케스트레이터가 새 터널 성공을 확인한 뒤에야 switch_routing_to_self()로
+        #   라우팅을 원자적으로 새 인터페이스로 넘기기 위함입니다.
+        # - exclude_interfaces: 이미 존재하는(기존 터널의) ppp 인터페이스 집합. 새 터널이
+        #   자신의 인터페이스를 식별할 때 이 집합을 제외해 '새로 생긴' 인터페이스만 고릅니다.
+        #   (그렇지 않으면 ifconfig 스캔이 기존 ppp0을 새 인터페이스로 오인함)
+        self.apply_routing_on_connect = apply_routing_on_connect
+        self._exclude_interfaces = set(exclude_interfaces or [])
 
         # 🛡️ 스플릿 터널링 시 회사 DNS 서버는 라우팅 대역 밖에 있어 도달 불가능한 경우가 대부분이며,
         # 그 상태로 DNS가 회사 서버로 덮어써지면 모든 도메인 해석이 실패해
@@ -219,7 +230,9 @@ class VPNConnector:
                     logger.info("[VPNConnector] VPN 터널 연결 성공! (Tunnel is up and running)")
                     # 이후 수명 감시(health check)에서도 재사용할 실제 ppp 인터페이스를 여기서 한 번만 확인
                     self._active_ppp_if = self._get_active_ppp_interface()
-                    if self.split_tunnel:
+                    # make-before-break 갱신용 대기 커넥터는 라우팅을 여기서 붙이지 않습니다.
+                    # (기존 터널이 라우팅을 쥐고 있어야 전환 전까지 무중단이 유지됨)
+                    if self.split_tunnel and self.apply_routing_on_connect:
                         self._apply_split_routing(self._active_ppp_if)
                     self.set_status(self.STATUS_CONNECTED)
                     break
@@ -312,11 +325,28 @@ class VPNConnector:
             logger.error(f"[VPNConnector] VPN 구동 스레드 내부 오류: {e}")
             self._fail()
 
+    @staticmethod
+    def list_active_ppp_interfaces():
+        """현재 UP/RUNNING 상태인 ppp 인터페이스 집합을 돌려줍니다.
+        make-before-break 갱신 직전에 '기존 인터페이스' 스냅샷을 떠서, 새 터널이
+        생성한 인터페이스만 골라낼 때 제외 집합으로 사용합니다."""
+        try:
+            res = subprocess.check_output(["ifconfig"], encoding="utf-8")
+            return set(re.findall(r"(ppp\d+): flags=.*<UP,POINTOPOINT,RUNNING", res))
+        except Exception as e:
+            logger.error(f"[VPNConnector] ppp 인터페이스 목록 조회 중 에러: {e}")
+            return set()
+
     def _get_active_ppp_interface(self, wait_seconds=10):
         """
         활성 ppp 인터페이스를 탐색합니다.
         'Tunnel is up' 로그 직후에는 인터페이스가 아직 뜨는 중일 수 있으므로
         잠시 재시도하며 대기합니다 (잘못된 인터페이스에 라우팅이 등록되는 것을 방지).
+
+        make-before-break 대기 커넥터는 self._exclude_interfaces(기존 터널 인터페이스)를
+        제외하고 '새로 생긴' 인터페이스만 고릅니다. 기존 인터페이스가 제외 집합에 있는데
+        새 인터페이스를 끝내 못 찾으면 None을 돌려주어(잘못된 ppp0 폴백 금지) 호출측이
+        전환을 취소하고 기존 터널을 유지하도록 합니다.
         """
         deadline = time.time() + wait_seconds
         while True:
@@ -324,12 +354,18 @@ class VPNConnector:
                 res = subprocess.check_output(["ifconfig"], encoding="utf-8")
                 # ppp 인터페이스 중 UP, RUNNING 상태 스캔
                 interfaces = re.findall(r"(ppp\d+): flags=.*<UP,POINTOPOINT,RUNNING", res)
-                if interfaces:
-                    return interfaces[0]
+                # 기존 터널 인터페이스는 제외하고 새로 생성된 것만 후보로
+                candidates = [i for i in interfaces if i not in self._exclude_interfaces]
+                if candidates:
+                    return candidates[0]
             except Exception as e:
                 logger.error(f"[VPNConnector] ppp 인터페이스 탐색 중 에러: {e}")
 
             if time.time() >= deadline:
+                if self._exclude_interfaces:
+                    # 새 터널의 인터페이스를 식별하지 못함 → 라우팅 전환 불가. 호출측이 실패 처리.
+                    logger.warning("[VPNConnector] 새 ppp 인터페이스를 찾지 못했습니다(기존 제외). 라우팅 전환을 진행할 수 없습니다.")
+                    return None
                 logger.warning("[VPNConnector] 활성 ppp 인터페이스를 찾지 못해 기본값 ppp0을 사용합니다.")
                 return "ppp0"  # 기본값 백업
             time.sleep(0.5)
@@ -363,7 +399,17 @@ class VPNConnector:
             # 확인 자체가 실패한 경우는 네트워크 명령어 문제일 수 있으므로 오탐(불필요한 재연결)을 피하기 위해 생존으로 간주
             return True, f"진단 명령 오류로 생존 간주({e})"
 
-    def _apply_split_routing(self, ppp_if=None):
+    def switch_routing_to_self(self):
+        """make-before-break: 스플릿 라우팅을 이 커넥터(새 터널)의 인터페이스로 원자적으로 재지정합니다.
+        기존 터널이 쥐고 있던 라우팅을 route change로 넘겨받은 뒤에야 기존 터널을 정리하므로
+        전환 시점의 트래픽 공백이 사실상 없습니다. 인터페이스가 확정되지 않았으면 False를 돌려줍니다."""
+        if not self._active_ppp_if:
+            logger.warning("[VPNConnector] 새 터널 인터페이스가 확정되지 않아 라우팅 전환을 진행할 수 없습니다.")
+            return False
+        self._apply_split_routing(self._active_ppp_if, switch=True)
+        return True
+
+    def _apply_split_routing(self, ppp_if=None, switch=False):
         if not self.split_routes:
             logger.info("[VPNConnector] 스플릿 라우팅 대역이 비어 있어 등록을 생략합니다.")
             return
@@ -372,7 +418,8 @@ class VPNConnector:
             ppp_if = self._get_active_ppp_interface()
         routes = [r.strip() for r in self.split_routes.split(",") if r.strip()]
 
-        logger.info(f"[VPNConnector] 🛠️ 스플릿 터널링 가동: 인터페이스 {ppp_if} 기준으로 정적 라우팅을 등록합니다...")
+        action = "전환(change)" if switch else "등록(add)"
+        logger.info(f"[VPNConnector] 🛠️ 스플릿 터널링 라우팅 {action}: 인터페이스 {ppp_if} 기준으로 처리합니다...")
 
         has_error = False
         for route in routes:
@@ -384,12 +431,24 @@ class VPNConnector:
                 has_error = True
                 continue
 
-            route_cmd = ["sudo", "-n", "route", "add", "-net", route, "-interface", ppp_if]
-            logger.info(f"[VPNConnector] 라우팅 테이블 등록 시도: {' '.join(route_cmd)}")
-            ret = subprocess.call(route_cmd)
+            if switch:
+                # 기존 인터페이스로 향하던 라우팅을 새 인터페이스로 원자적 재지정.
+                # 해당 대역이 아직 라우팅 테이블에 없으면 change가 실패하므로 add로 폴백합니다.
+                change_cmd = ["sudo", "-n", "route", "change", "-net", route, "-interface", ppp_if]
+                logger.info(f"[VPNConnector] 라우팅 전환 시도: {' '.join(change_cmd)}")
+                ret = subprocess.call(change_cmd)
+                if ret != 0:
+                    add_cmd = ["sudo", "-n", "route", "add", "-net", route, "-interface", ppp_if]
+                    logger.info(f"[VPNConnector] change 실패 → add 폴백: {' '.join(add_cmd)}")
+                    ret = subprocess.call(add_cmd)
+            else:
+                route_cmd = ["sudo", "-n", "route", "add", "-net", route, "-interface", ppp_if]
+                logger.info(f"[VPNConnector] 라우팅 테이블 등록 시도: {' '.join(route_cmd)}")
+                ret = subprocess.call(route_cmd)
+
             if ret != 0:
-                logger.warning(f"[VPNConnector] ⚠️ 라우팅 등록 실패(반환 코드 {ret}): {' '.join(route_cmd)}")
+                logger.warning(f"[VPNConnector] ⚠️ 라우팅 {action} 실패(반환 코드 {ret}): {route} → {ppp_if}")
                 has_error = True
 
         if has_error:
-            logger.warning("[VPNConnector] ⚠️ 일부 라우팅 추가에 실패했습니다. '/etc/sudoers.d/openfortivpn' 권한이 갱신되지 않았거나 (/sbin/route NOPASSWD 미등록), 이미 등록된 대역일 수 있습니다.")
+            logger.warning("[VPNConnector] ⚠️ 일부 라우팅 처리에 실패했습니다. '/etc/sudoers.d/openfortivpn' 권한이 갱신되지 않았거나 (/sbin/route NOPASSWD 미등록), 이미 등록된 대역일 수 있습니다.")

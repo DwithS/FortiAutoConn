@@ -600,6 +600,15 @@ class FortiAutoConnApp(rumps.App):
     # 최소화하면 macOS의 '앱 접근 승인' 팝업도 딱 이 하나(비밀번호 묶음)로만 뜨게 됩니다.
     CONFIG_ACCOUNT = "config"
     SECRET_FIELDS = {"vpn_pass", "mail_pass"}
+
+    # ⏳ 예측형 세션 갱신(make-before-break) 설정.
+    # FortiGate 세션은 약 8시간 뒤 만료되어 터널이 끊깁니다. 만료를 사후에 감지(≈15초)하고
+    # 백오프(10초) 뒤 재연결하면 수십 초의 공백이 생기므로, 만료 직전에 '기존 터널을 유지한 채'
+    # 새 터널을 미리 띄우고 성공하면 라우팅만 갈아끼워(무중단) 공백을 최소화합니다.
+    # 이 최적화는 라우팅을 우리가 직접 관리하는 스플릿 터널 모드에서만 켭니다.
+    SESSION_LIFETIME_SECONDS = 8 * 3600
+    SESSION_REFRESH_MARGIN_SECONDS = 10 * 60      # 만료 10분 전에 갱신 시작
+    SESSION_REFRESH_RETRY_SECONDS = 120           # 일시적 실패 시 만료 전까지 짧게 재시도하는 간격
     CONFIG_DIR = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "FortiAutoConn")
     CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
     # 예전 버전(필드별 개별 keychain 항목)과의 호환을 위한 마이그레이션 대상 필드 목록
@@ -717,6 +726,11 @@ class FortiAutoConnApp(rumps.App):
         self.auto_reconnect_enabled = False
         self.reconnect_timer = None
         self.settings_server = None
+
+        # 예측형 세션 갱신(make-before-break) 상태
+        self.session_refresh_timer = None     # 만료 직전 갱신을 예약하는 타이머
+        self.standby_connector = None         # 갱신 중 임시로 띄우는 '새 터널' 커넥터
+        self._refresh_in_progress = False     # 갱신 진행 중 기존 커넥터의 끊김 이벤트를 무시하기 위한 플래그
         # Connect 클릭 ~ Touch ID 인증 사이에는 메뉴가 아직 활성 상태라 더블클릭 시
         # 연결 절차가 2개 돌 수 있음 → 논블로킹 락으로 동시 진입을 차단
         self._connect_lock = threading.Lock()
@@ -760,22 +774,36 @@ class FortiAutoConnApp(rumps.App):
             # 성공 시 재연결 시도 횟수 즉시 초기화
             self.reconnect_attempts = 0
             logger.info("[App] VPN 연결 성공. 재시도 카운트 초기화 (0)")
-            
+            # 8시간 만료 직전 무중단 갱신(make-before-break) 예약
+            self._schedule_session_refresh()
+
         elif status == VPNConnector.STATUS_CONNECTING:
             self.title = "🟡"
             self.menu_connect.set_callback(None)
             self.menu_disconnect.set_callback(self.on_disconnect)
             
         elif status == VPNConnector.STATUS_DISCONNECTED:
+            # make-before-break 갱신 진행 중에는 기존 커넥터가 보낸 끊김 이벤트를 무시합니다.
+            # (동시 세션 제한 게이트웨이가 새 로그인 시 기존 세션을 밀어내면 기존 커넥터가
+            #  DISCONNECTED를 쏘는데, 이 시점의 복구는 갱신 오케스트레이터가 전담합니다.)
+            if self._refresh_in_progress:
+                logger.info("[App] 세션 갱신 진행 중 기존 터널 끊김 이벤트 수신 — 갱신 오케스트레이터가 처리하므로 무시합니다.")
+                return
+
             self.title = "🔴"
             self.menu_connect.set_callback(self.on_connect)
             self.menu_disconnect.set_callback(None)
-            
+
             # 의도치 않은 접속 강제 해제 발생 시 (예: 8시간 세션 만료) 자동 재연결
             if self.auto_reconnect_enabled and self.cached_creds:
                 self._handle_reconnect_flow("VPN 연결 해제됨", "VPN 연결이 세션 만료 등으로 분리되었습니다.")
-                
+
         elif status == VPNConnector.STATUS_FAILED:
+            # 갱신 진행 중 들어온 실패 이벤트도 오케스트레이터가 전담 처리합니다.
+            if self._refresh_in_progress:
+                logger.info("[App] 세션 갱신 진행 중 실패 이벤트 수신 — 갱신 오케스트레이터가 처리하므로 무시합니다.")
+                return
+
             self.title = "🔴"
             self.menu_connect.set_callback(self.on_connect)
             self.menu_disconnect.set_callback(None)
@@ -869,9 +897,13 @@ class FortiAutoConnApp(rumps.App):
         self.connector = self._build_connector(self.cached_creds)
         self.connector.start()
 
-    def _build_connector(self, creds):
+    def _build_connector(self, creds, apply_routing_on_connect=True, exclude_interfaces=None, on_status_change=None):
         """자격 증명 딕셔너리로 MailChecker + VPNConnector를 조립합니다.
-        (수동 연결과 자동 재연결이 동일한 구성 경로를 타도록 단일화)"""
+        (수동 연결과 자동 재연결이 동일한 구성 경로를 타도록 단일화)
+
+        make-before-break 갱신용 '대기 커넥터'는 apply_routing_on_connect=False로 라우팅을
+        미루고, exclude_interfaces로 기존 터널 인터페이스를 제외해 자신의 새 인터페이스를
+        식별하며, 별도 on_status_change 콜백으로 메인 UI/재연결 경로와 분리해 구동합니다."""
         mail_checker = MailChecker(
             host=creds["mail_host"],
             port=creds["mail_port"],
@@ -886,11 +918,153 @@ class FortiAutoConnApp(rumps.App):
             username=creds["vpn_user"],
             password=creds["vpn_pass"],
             mail_checker=mail_checker,
-            on_status_change=self.on_status_change,
+            on_status_change=(on_status_change or self.on_status_change),
             dns_bypass=(creds.get("vpn_dns_bypass") == "true"),
             split_tunnel=(creds.get("vpn_split_tunnel") == "true"),
-            split_routes=creds.get("vpn_split_routes", "")
+            split_routes=creds.get("vpn_split_routes", ""),
+            apply_routing_on_connect=apply_routing_on_connect,
+            exclude_interfaces=exclude_interfaces
         )
+
+    def _schedule_session_refresh(self):
+        """8시간 만료 직전에 무중단 세션 갱신(make-before-break)을 예약합니다.
+        라우팅을 우리가 직접 관리하는 스플릿 터널 모드에서만 동작하며, 풀 터널 모드에서는
+        두 openfortivpn 프로세스가 기본 라우트를 두고 충돌하므로 기존 reactive 재연결에 맡깁니다."""
+        if not (self.auto_reconnect_enabled and self.cached_creds):
+            return
+        if self.cached_creds.get("vpn_split_tunnel") != "true":
+            logger.info("[App] 스플릿 터널 모드가 아니므로 예측형 세션 갱신을 건너뜁니다. (만료 시 기존 재연결 로직 사용)")
+            return
+
+        if self.session_refresh_timer:
+            self.session_refresh_timer.cancel()
+        delay = self.SESSION_LIFETIME_SECONDS - self.SESSION_REFRESH_MARGIN_SECONDS
+        logger.info(
+            f"[App] 세션 자동 갱신 예약: {delay}초 후(만료 약 {self.SESSION_REFRESH_MARGIN_SECONDS // 60}분 전) "
+            f"make-before-break 무중단 재연결을 시도합니다."
+        )
+        self.session_refresh_timer = threading.Timer(delay, self._perform_session_refresh)
+        self.session_refresh_timer.daemon = True
+        self.session_refresh_timer.start()
+
+    def _perform_session_refresh(self):
+        """(타이머 스레드에서 호출) 기존 터널을 유지한 채 새 터널을 띄우고,
+        성공하면 라우팅을 새 인터페이스로 원자적으로 전환한 뒤 기존 터널을 정리합니다."""
+        if not (self.auto_reconnect_enabled and self.cached_creds):
+            return
+        if not (self.connector and self.connector.status == VPNConnector.STATUS_CONNECTED):
+            logger.info("[App] 현재 연결 상태가 아니어서 세션 갱신을 건너뜁니다.")
+            return
+        if self._refresh_in_progress:
+            logger.info("[App] 이미 세션 갱신이 진행 중이라 중복 실행을 무시합니다.")
+            return
+
+        logger.info("[App] 🔄 make-before-break 세션 갱신 시작: 기존 터널을 유지한 채 새 터널을 구축합니다.")
+        self._refresh_in_progress = True
+        old_connector = self.connector
+        standby = None
+        try:
+            # 새 터널이 생성할 인터페이스를 나중에 식별하기 위해 현재 ppp 인터페이스 스냅샷
+            existing_ifaces = VPNConnector.list_active_ppp_interfaces()
+
+            standby_event = threading.Event()
+            standby_state = {"status": None}
+
+            def _on_standby_status(new_status):
+                # 대기 커넥터는 메인 UI/재연결 경로와 분리해, 종단 상태만 이벤트로 통지받습니다.
+                if new_status in (VPNConnector.STATUS_CONNECTED, VPNConnector.STATUS_FAILED):
+                    standby_state["status"] = new_status
+                    standby_event.set()
+
+            standby = self._build_connector(
+                self.cached_creds,
+                apply_routing_on_connect=False,       # 성공 확인 전까지 라우팅은 기존 터널이 유지
+                exclude_interfaces=existing_ifaces,    # 새로 생긴 인터페이스만 식별
+                on_status_change=_on_standby_status,
+            )
+            self.standby_connector = standby
+            standby.start()
+
+            # OTP 메일 대기 + 터널 수립 시간을 감안한 여유 타임아웃
+            timeout = VPNConnector.OTP_WAIT_SECONDS + 60
+            if not standby_event.wait(timeout) or standby_state["status"] != VPNConnector.STATUS_CONNECTED:
+                logger.warning("[App] 새 터널 구축 실패/타임아웃 — 기존 터널을 유지합니다.")
+                standby.stop(notify=False)
+                self.standby_connector = None
+                self._refresh_in_progress = False
+                self._recover_after_failed_refresh(old_connector, standby)
+                return
+
+            new_if = standby._active_ppp_if
+            if not new_if:
+                logger.warning("[App] 새 터널 인터페이스를 식별하지 못해 전환을 취소합니다. 기존 터널 유지.")
+                standby.stop(notify=False)
+                self.standby_connector = None
+                self._refresh_in_progress = False
+                self._recover_after_failed_refresh(old_connector, standby)
+                return
+
+            # 🔀 라우팅을 새 인터페이스로 원자적 전환 (여기 도달 전까지 트래픽은 기존 터널로 흐름)
+            logger.info(f"[App] 새 터널({new_if}) 구축 성공. 스플릿 라우팅을 새 인터페이스로 전환합니다.")
+            standby.switch_routing_to_self()
+
+            # 기존 터널을 조용히(상태 재통지 없이) 정리하고 새 커넥터로 승격
+            old_connector.stop(notify=False)
+            standby.on_status_change = self.on_status_change  # 이후 상태 이벤트는 정상 UI/재연결 경로로
+            self.connector = standby
+            self.standby_connector = None
+            self.reconnect_attempts = 0
+            self._refresh_in_progress = False
+
+            logger.info("[App] ✅ make-before-break 세션 갱신 완료. 새 터널로 무중단 전환되었습니다.")
+            self.show_notification("FortiAutoConn", "세션 자동 갱신 완료", "8시간 만료 전 새 터널로 무중단 전환했습니다.")
+
+            # 다음 갱신 예약 (승격된 새 터널 기준으로 8시간 주기 지속)
+            self._schedule_session_refresh()
+        except Exception as e:
+            logger.error(f"[App] 세션 갱신 중 오류: {e}")
+            if standby:
+                try:
+                    standby.stop(notify=False)
+                except Exception:
+                    pass
+            self.standby_connector = None
+            self._refresh_in_progress = False
+            self._recover_after_failed_refresh(old_connector, standby)
+
+    def _recover_after_failed_refresh(self, old_connector, standby):
+        """새 터널 구축 실패 후 복구 처리.
+        - 기존 터널이 여전히 살아있고 실패 원인이 일시적(사유 미지정)이면 만료 전 짧게 재시도합니다.
+        - 실패 원인이 인증/OTP 등 재시도 무의미(또는 계정 잠금 위험)한 사유라면, 인증 메일 남발을
+          피하기 위해 재시도하지 않고 기존 터널을 만료까지 유지합니다(만료 시 표준 경로가 처리).
+        - 기존 터널마저 끊긴 상태(동시 세션 제한 게이트웨이가 기존 세션을 밀어낸 경우)라면
+          표준 자동 재연결 플로우로 복구합니다."""
+        old_alive = (
+            old_connector is not None
+            and old_connector is self.connector
+            and old_connector.status == VPNConnector.STATUS_CONNECTED
+        )
+        if old_alive:
+            tunnel_up, _ = old_connector._probe_ppp_interface(old_connector._active_ppp_if)
+            if tunnel_up:
+                reason = standby.failure_reason if standby else None
+                if reason is None:
+                    logger.info(f"[App] 기존 터널이 살아있어 {self.SESSION_REFRESH_RETRY_SECONDS}초 후 세션 갱신을 재시도합니다.")
+                    if self.session_refresh_timer:
+                        self.session_refresh_timer.cancel()
+                    self.session_refresh_timer = threading.Timer(self.SESSION_REFRESH_RETRY_SECONDS, self._perform_session_refresh)
+                    self.session_refresh_timer.daemon = True
+                    self.session_refresh_timer.start()
+                else:
+                    logger.warning(
+                        f"[App] 갱신 실패 사유({reason})가 재시도로 해결되지 않으므로 미리 재시도하지 않습니다. "
+                        f"기존 터널을 만료까지 유지하며, 만료 시 표준 재연결이 원인을 처리/안내합니다."
+                    )
+                return
+
+        logger.warning("[App] 기존 터널도 유실된 상태 — 표준 자동 재연결 플로우로 복구합니다.")
+        if self.auto_reconnect_enabled and self.cached_creds:
+            self._handle_reconnect_flow("VPN 세션 갱신 실패", "세션 갱신 중 기존 연결이 종료되어 재연결을 시도합니다.")
 
     def on_connect(self, sender):
         """Connect VPN 메뉴 버튼 클릭 이벤트 처리 (메인 스레드 대기 방지를 위해 백그라운드 스레드에서 비동기 처리)"""
@@ -947,14 +1121,23 @@ class FortiAutoConnApp(rumps.App):
         logger.info("[App] 사용자가 수동으로 Disconnect VPN을 호출했습니다. 자동 재연결 비활성화 처리.")
         self.auto_reconnect_enabled = False
         self.reconnect_attempts = 0
-        
+
         if self.reconnect_timer:
             self.reconnect_timer.cancel()
-            
+
+        # 예측형 세션 갱신 예약/진행 중인 대기 커넥터도 함께 정리
+        if self.session_refresh_timer:
+            self.session_refresh_timer.cancel()
+            self.session_refresh_timer = None
+        self._refresh_in_progress = False
+        if self.standby_connector:
+            self.standby_connector.stop(notify=False)
+            self.standby_connector = None
+
         if self.connector:
             self.connector.stop()
             self.connector = None
-            
+
         self.cached_creds = None
         self.show_notification("FortiAutoConn", "VPN 접속 종료 완료", "자동화 VPN 터널 연결이 정상 해제되었습니다.")
 
@@ -1053,6 +1236,11 @@ class FortiAutoConnApp(rumps.App):
         self.auto_reconnect_enabled = False
         if self.reconnect_timer:
             self.reconnect_timer.cancel()
+        if self.session_refresh_timer:
+            self.session_refresh_timer.cancel()
+        self._refresh_in_progress = False
+        if self.standby_connector:
+            self.standby_connector.stop(notify=False)
         if self.connector:
             self.connector.stop()
         if self.settings_server:
