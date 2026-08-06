@@ -255,10 +255,23 @@ class MailChecker:
         now = datetime.datetime.now(datetime.timezone.utc)
         # 이 나이를 넘긴 코드는 제출해도 만료로 실패할 가능성이 높아 사용하지 않습니다.
         max_usable_age = self.OTP_VALIDITY_SECONDS - self.OTP_SUBMIT_MARGIN_SECONDS
+
+        # 🚀 SEARCH 대상을 최근 메일로 한정해 서버측 스캔 비용을 줄입니다.
+        # 인증 메일함에 누적된 과거 OTP 메일(로그상 sender 매칭 400건)을 서버가 폴링마다 전부
+        # 스캔하느라 SEARCH가 9~16초씩 걸리던 것이 실측된 주 병목이었습니다. OTP는 발송 후
+        # 60초만 유효하므로 오래된 메일을 볼 필요가 없어 SINCE로 최근 1일치만 검색합니다.
+        # (서버 로컬 타임존/자정 경계로 당일치가 잘려나가는 것을 막기 위해 하루 여유를 둡니다.
+        #  범위 안에 남는 과거 메일은 어차피 아래 코드 나이 필터가 걸러냅니다.)
+        # 주의: strftime("%b")는 한국어 로케일에서 '7월'을 반환해 IMAP 날짜 포맷을 깨뜨리므로
+        # 영문 월 약어를 직접 조립합니다.
+        _MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+        since = start_time - datetime.timedelta(days=1)
+        since_date = f"{since.day:02d}-{_MONTHS[since.month - 1]}-{since.year}"
+
         # 진단: SEARCH 왕복 시간을 측정합니다. 좀비 커넥션이면 여기서 소켓 타임아웃까지
         # 블록되므로, 이 값이 8초에 근접하면 커넥션이 죽은 것으로 판단할 수 있습니다.
         t0 = time.monotonic()
-        status, messages = mail.search(None, f'FROM "{sender_filter}"')
+        status, messages = mail.search(None, f'FROM "{sender_filter}" SINCE {since_date}')
         search_ms = (time.monotonic() - t0) * 1000
         matched = len(messages[0].split()) if (status == "OK" and messages and messages[0]) else 0
         # 느린 SEARCH는 평상시 로그에서도 보이도록 승격 (SELECT vs SEARCH 지연 원인 구분용)

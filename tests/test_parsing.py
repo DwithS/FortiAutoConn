@@ -84,8 +84,10 @@ class FakeIMAP:
 
     def __init__(self, raw_messages):
         self.raw_messages = raw_messages
+        self.last_query = None  # 마지막 SEARCH 쿼리 문자열 기록 (SINCE 필터 검증용)
 
     def search(self, charset, query):
+        self.last_query = query
         if not self.raw_messages:
             return ("OK", [b""])
         ids = b" ".join(str(i + 1).encode() for i in range(len(self.raw_messages)))
@@ -124,6 +126,18 @@ def test_scan_skips_already_consumed_message():
     checker = _checker()
     assert checker._scan_for_otp(fake, SENDER, OTP_CODE_PATTERN, now) == "123456"
     assert checker._scan_for_otp(fake, SENDER, OTP_CODE_PATTERN, now) is None
+
+
+def test_scan_search_query_limits_by_since_date_english_month():
+    # SEARCH가 SINCE로 최근 메일만 조회하는지 + 날짜가 IMAP 규격(영문 월)인지 검증.
+    # (strftime("%b")는 한국어 로케일에서 '7월'을 반환해 IMAP 날짜를 깨뜨리므로 회귀 방지)
+    _consumed_message_ids.clear()
+    # 결정적 검증을 위해 고정 시각(2026-07-27) 기준으로 하루 여유 → SINCE 26-Jul-2026 기대
+    fixed = datetime.datetime(2026, 7, 27, 10, 0, 0, tzinfo=datetime.timezone.utc)
+    fake = FakeIMAP([make_raw_mail("123456", fixed, "<since@test>")])
+    _checker()._scan_for_otp(fake, SENDER, OTP_CODE_PATTERN, fixed)
+    assert f'FROM "{SENDER}"' in fake.last_query
+    assert "SINCE 26-Jul-2026" in fake.last_query
 
 
 # ---------- 폴더 목록 바이트 매칭 ----------
